@@ -107,16 +107,35 @@ escape the workspace are rejected.
 
 ## Security
 
-This service executes agent CLIs and can commit and push git repositories. Treat it
-as a privileged local daemon:
+**This service runs coding agents with their safety prompts turned off.** That is what
+makes unattended dispatch work — an agent that stops to ask for approval simply hangs
+when nobody is at the keyboard — but it means anyone who can reach the API can run
+arbitrary code as the user running the gateway.
+
+Specifically, the CLI adapters pass:
+
+| Agent | Flag | Opt out |
+| --- | --- | --- |
+| Codex | `--dangerously-bypass-approvals-and-sandbox` | `bypassApprovals: false` |
+| Antigravity | `--dangerously-skip-permissions` | `bypassPermissions: false` |
+
+Both default to bypassing. The opt-outs are adapter-level options; they are not yet
+plumbed through the MCP tools or the REST API, so over HTTP the bypass is currently
+unconditional.
+
+Treat this as a privileged local daemon:
 
 - It binds to `127.0.0.1` by default. Setting `AGENT_BRIDGE_HOST` to anything else
-  exposes task dispatch and git push to your network.
+  exposes task dispatch, sandbox-free code execution, and git push to your network.
 - The auth token is a single shared secret, sent as a bearer header or a `token`
   query parameter. Query parameters end up in logs — prefer the header where you can.
+  Compromising that one token is equivalent to handing over a shell.
 - There is no sandboxing between projects beyond the workspace path check.
+- `/api/git/commit-push` pushes to whatever remote the target repository has
+  configured. It does not ask again before pushing.
 
-Do not expose this to an untrusted network.
+Do not expose this to an untrusted network, and do not run it as a user with more
+access than the work actually needs.
 
 ## Development
 

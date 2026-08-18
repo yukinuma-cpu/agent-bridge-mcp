@@ -80,6 +80,11 @@ export class AntigravityAdapter {
       cwd: string;
       timeoutMs?: number;
       model?: string;
+      /**
+       * 既定では agy の権限確認を飛ばす。無人実行が前提のため、確認を残すと
+       * プロンプト待ちのまま止まる。対話的に承認したい場合だけ false を渡す。
+       */
+      bypassPermissions?: boolean;
       onOutput?: (chunk: string) => void;
     }
   ): {
@@ -87,7 +92,10 @@ export class AntigravityAdapter {
     promise: Promise<AntigravityExecutionResult>;
   } {
     const agy = this.resolveAgy();
-    const agyArgs = ["-p", prompt, "--dangerously-skip-permissions"];
+    const agyArgs = ["-p", prompt];
+    if (options.bypassPermissions !== false) {
+      agyArgs.push("--dangerously-skip-permissions");
+    }
     if (options.model) agyArgs.push("--model", options.model);
 
     let executable: string;
