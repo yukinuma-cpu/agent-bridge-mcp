@@ -1,0 +1,63 @@
+{
+  "name": "@yukinuma/agent-bridge-mcp",
+  "version": "0.2.0",
+  "description": "MCP server and HTTP gateway that dispatches coding tasks to Claude Code and Codex CLI sessions, with an evidence gate and review loop",
+  "type": "module",
+  "main": "dist/server/mcp-server.js",
+  "types": "dist/server/mcp-server.d.ts",
+  "bin": {
+    "agent-bridge-mcp": "./dist/server/mcp-server.js",
+    "agent-bridge-gateway": "./dist/start-gateway.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/server/mcp-server.js",
+    "gateway": "node dist/start-gateway.js",
+    "test:full": "node dist/test-full-spec.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude-code",
+    "codex",
+    "agent",
+    "orchestration"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yukinuma-cpu/agent-bridge-mcp.git"
+  },
+  "homepage": "https://github.com/yukinuma-cpu/agent-bridge-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/yukinuma-cpu/agent-bridge-mcp/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.117.1",
+    "@hono/node-server": "^1.13.8",
+    "@modelcontextprotocol/sdk": "^1.6.0",
+    "@openai/codex-sdk": "^0.147.0",
+    "hono": "^4.7.2",
+    "ws": "^8.18.1",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "@types/ws": "^8.5.14",
+    "typescript": "^5.8.2"
+  },
+  "license": "MIT"
+}
