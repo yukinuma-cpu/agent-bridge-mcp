@@ -132,6 +132,7 @@ export class SessionRouter {
     if (options.agent === "antigravity") {
       const { process: child, promise } = this.antigravityAdapter.execute(options.prompt, {
         cwd,
+        externalSessionId: session.externalSessionId,
         model: options.model,
         timeoutMs: options.timeoutMs,
         onOutput: (chunk) => this.taskManager.appendOutput(task.id, chunk),
@@ -147,10 +148,12 @@ export class SessionRouter {
             output: res.output || res.error || "",
             error: res.error,
             exitCode: res.exitCode,
+            externalSessionId: res.detectedSessionId,
           });
 
           if (session) {
             await this.sessionStore.updateSession(session.id, {
+              externalSessionId: res.detectedSessionId || session.externalSessionId,
               engine: "cli",
               summary: options.prompt.slice(0, 100),
             });
