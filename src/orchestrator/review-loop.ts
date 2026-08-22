@@ -11,7 +11,7 @@ async function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function parseReviewVerdict(output: string): ReviewVerdict {
+export function parseReviewVerdict(output: string): ReviewVerdict {
   const firstLine = output
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -129,8 +129,6 @@ Instructions:
       const reviewOutput = reviewTask?.output || "";
       let verdict = parseReviewVerdict(reviewOutput);
 
-      // PASS is valid only when every non-LLM gate also succeeded. A reviewer cannot
-      // override missing/failed evidence or a failed implementation task by wording.
       if (
         verdict === "PASS" &&
         (implTask?.status !== "completed" || reviewTask?.status !== "completed" || !evidence.allPassed)
@@ -138,7 +136,6 @@ Instructions:
         verdict = "REVISE";
       }
 
-      // A failed reviewer task never counts as a semantic verdict.
       if (reviewTask?.status !== "completed" && verdict !== "ESCALATE") {
         verdict = "REVISE";
       }
