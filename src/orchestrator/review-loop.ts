@@ -11,6 +11,17 @@ async function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function parseReviewVerdict(output: string): ReviewVerdict {
+  const firstLine = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean) || "";
+
+  if (/^PASS\b/.test(firstLine)) return "PASS";
+  if (/^ESCALATE\b/.test(firstLine)) return "ESCALATE";
+  return "REVISE";
+}
+
 export class ReviewLoopOrchestrator {
   private router: SessionRouter;
   private evidenceGate: EvidenceGate;
@@ -43,10 +54,8 @@ export class ReviewLoopOrchestrator {
     const iterations: ReviewLoopIteration[] = [];
     let currentPrompt = options.prompt;
     let iteration = 0;
-    let finalVerdict: ReviewVerdict = "REVISE";
 
     while (iteration <= maxRevisions) {
-      // 1. Dispatch Implementation Task to Implementer Agent
       const implSend = await this.router.dispatch({
         agent: implementer as any,
         prompt: currentPrompt,
@@ -58,25 +67,25 @@ export class ReviewLoopOrchestrator {
         timeoutMs,
       });
 
-      // Wait for Codex implementation to complete
       let implTask = await this.router.getTaskManager().getTask(implSend.taskId);
       while (implTask && (implTask.status === "running" || implTask.status === "queued")) {
         await sleep(1000);
         implTask = await this.router.getTaskManager().getTask(implSend.taskId);
       }
 
-      // 2. Evaluate Evidence Gate (Git diff + Automated Tests)
       const evidence = await this.evidenceGate.evaluate({
         cwd: options.cwd,
         testCommands: options.testCommands,
         timeoutMs: 60000,
       });
 
-      // 3. Dispatch Review Task to Claude (Reviewer Independence: separate task_type/session)
       const reviewPrompt = `
 You are a senior code reviewer.
 Original Task:
 ${options.prompt}
+
+Implementation Task Status:
+${implTask?.status || "missing"}
 
 Implementation Output:
 ${implTask?.output || "(No text output)"}
@@ -94,9 +103,10 @@ ${evidence.tests.map((t) => `- [${t.passed ? "PASS" : "FAIL"}] \`${t.command}\`:
 
 Instructions:
 1. Review the changes thoroughly.
-2. If the implementation is correct and all tests pass, start your response with "PASS" followed by a summary.
-3. If there are issues, bugs, or failing tests, start your response with "REVISE" followed by specific, actionable instructions for ${implementer}.
-4. If the task is impossible, contradictory, or requires human business decision, start with "ESCALATE".
+2. The first non-empty line MUST be exactly one verdict token followed optionally by a short reason: PASS, REVISE, or ESCALATE.
+3. Use PASS only when the implementation is correct and the Evidence Gate passed.
+4. Use REVISE for bugs, incomplete work, failed/missing evidence, or failed implementation tasks, followed by actionable instructions for ${implementer}.
+5. Use ESCALATE only when the task is impossible, contradictory, or requires a human business decision.
 `.trim();
 
       const reviewSend = await this.router.dispatch({
@@ -110,7 +120,6 @@ Instructions:
         timeoutMs,
       });
 
-      // Wait for reviewer review to complete
       let reviewTask = await this.router.getTaskManager().getTask(reviewSend.taskId);
       while (reviewTask && (reviewTask.status === "running" || reviewTask.status === "queued")) {
         await sleep(1000);
@@ -118,13 +127,19 @@ Instructions:
       }
 
       const reviewOutput = reviewTask?.output || "";
-      let verdict: ReviewVerdict = "REVISE";
+      let verdict = parseReviewVerdict(reviewOutput);
 
-      if (reviewOutput.startsWith("PASS") || reviewOutput.includes("PASS")) {
-        verdict = "PASS";
-      } else if (reviewOutput.startsWith("ESCALATE") || reviewOutput.includes("ESCALATE")) {
-        verdict = "ESCALATE";
-      } else {
+      // PASS is valid only when every non-LLM gate also succeeded. A reviewer cannot
+      // override missing/failed evidence or a failed implementation task by wording.
+      if (
+        verdict === "PASS" &&
+        (implTask?.status !== "completed" || reviewTask?.status !== "completed" || !evidence.allPassed)
+      ) {
+        verdict = "REVISE";
+      }
+
+      // A failed reviewer task never counts as a semantic verdict.
+      if (reviewTask?.status !== "completed" && verdict !== "ESCALATE") {
         verdict = "REVISE";
       }
 
@@ -137,8 +152,6 @@ Instructions:
         feedback: reviewOutput,
       });
 
-      finalVerdict = verdict;
-
       if (verdict === "PASS") {
         return {
           status: "PASSED",
@@ -146,7 +159,7 @@ Instructions:
           maxRevisionsReached: false,
           iterations,
           finalVerdict: "PASS",
-          summary: `Task completed successfully and approved by Claude in iteration ${iteration}.`,
+          summary: `Task completed successfully with passing evidence and reviewer approval in iteration ${iteration}.`,
         };
       }
 
@@ -157,18 +170,20 @@ Instructions:
           maxRevisionsReached: false,
           iterations,
           finalVerdict: "ESCALATE",
-          summary: `Task escalated by Claude in iteration ${iteration}: ${reviewOutput.slice(0, 200)}`,
+          summary: `Task escalated by reviewer in iteration ${iteration}: ${reviewOutput.slice(0, 200)}`,
         };
       }
 
-      // If REVISE, prepare next prompt for Codex
       iteration++;
       if (iteration <= maxRevisions) {
         currentPrompt = `
-Reviewer Claude requested revisions:
-${reviewOutput}
+Reviewer requested revisions:
+${reviewOutput || "Reviewer did not return a valid PASS/ESCALATE verdict."}
 
-Please fix the issues identified by the reviewer and ensure all tests pass.
+Evidence status:
+${evidence.summary}
+
+Please fix the issues and ensure the configured verification commands pass.
 `.trim();
       }
     }
@@ -179,7 +194,7 @@ Please fix the issues identified by the reviewer and ensure all tests pass.
       maxRevisionsReached: true,
       iterations,
       finalVerdict: "REVISE",
-      summary: `Max revisions limit (${maxRevisions}) reached without full PASS. Escalating to Antigravity/User.`,
+      summary: `Max revisions limit (${maxRevisions}) reached without a verified PASS. Escalating to Antigravity/User.`,
     };
   }
 }
