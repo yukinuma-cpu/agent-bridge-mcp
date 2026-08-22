@@ -55,6 +55,26 @@ export class SessionRouter {
     return this.workspaceDir;
   }
 
+  private assertSessionCompatible(
+    session: SessionMetadata,
+    options: AgentExecutionOptions,
+    cwd: string,
+    engine: AdapterEngine
+  ): void {
+    if (session.agent !== options.agent) {
+      throw new Error(`Session ${session.id} belongs to agent '${session.agent}', not '${options.agent}'`);
+    }
+    if (path.resolve(session.cwd) !== cwd) {
+      throw new Error(`Session ${session.id} belongs to a different working directory`);
+    }
+    if (options.project && session.project && session.project !== options.project) {
+      throw new Error(`Session ${session.id} belongs to project '${session.project}', not '${options.project}'`);
+    }
+    if (session.engine && session.engine !== engine) {
+      throw new Error(`Session ${session.id} uses engine '${session.engine}', not '${engine}'`);
+    }
+  }
+
   async dispatch(options: AgentExecutionOptions): Promise<AgentSendResult> {
     await this.init();
     const cwd = this.resolveWorkingDirectory({ cwd: options.cwd, project: options.project });
@@ -70,6 +90,10 @@ export class SessionRouter {
 
     if (options.sessionId) {
       session = await this.sessionStore.getSession(options.sessionId);
+      if (!session) {
+        throw new Error(`Session not found: ${options.sessionId}`);
+      }
+      this.assertSessionCompatible(session, options, cwd, engine);
     } else if (!options.forceNewSession) {
       session = await this.sessionStore.findMatchingSession({
         agent: options.agent,
@@ -78,6 +102,9 @@ export class SessionRouter {
         topic: options.topic,
         taskType: options.taskType,
       });
+      if (session && session.engine && session.engine !== engine) {
+        session = undefined;
+      }
     }
 
     if (!session) {
