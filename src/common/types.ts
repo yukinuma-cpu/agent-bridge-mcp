@@ -1,4 +1,4 @@
-export type AgentType = "claude" | "codex" | "antigravity";
+export type AgentType = string;
 
 export type AdapterEngine = "cli" | "sdk";
 
