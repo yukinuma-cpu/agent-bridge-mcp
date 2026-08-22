@@ -7,6 +7,7 @@ export class TaskManager {
   private filePath: string;
   private tasks: Map<string, TaskRecord> = new Map();
   private runningProcesses: Map<string, ChildProcess> = new Map();
+  private runningCancels: Map<string, () => void> = new Map();
   private loaded = false;
   private onOutputChunk?: (taskId: string, chunk: string) => void;
 
@@ -81,8 +82,7 @@ export class TaskManager {
     return record;
   }
 
-  registerProcess(taskId: string, child: ChildProcess): void {
-    this.runningProcesses.set(taskId, child);
+  private markRunning(taskId: string): void {
     const task = this.tasks.get(taskId);
     if (task) {
       task.status = "running";
@@ -91,9 +91,19 @@ export class TaskManager {
     }
   }
 
+  registerProcess(taskId: string, child: ChildProcess): void {
+    this.runningProcesses.set(taskId, child);
+    this.markRunning(taskId);
+  }
+
+  registerCancellation(taskId: string, cancel: () => void): void {
+    this.runningCancels.set(taskId, cancel);
+    this.markRunning(taskId);
+  }
+
   appendOutput(taskId: string, chunk: string): void {
     const task = this.tasks.get(taskId);
-    if (task) {
+    if (task && task.status !== "cancelled") {
       task.output += chunk;
       if (this.onOutputChunk) {
         this.onOutputChunk(taskId, chunk);
@@ -113,8 +123,14 @@ export class TaskManager {
   ): Promise<TaskRecord | undefined> {
     await this.init();
     this.runningProcesses.delete(taskId);
+    this.runningCancels.delete(taskId);
     const task = this.tasks.get(taskId);
     if (!task) return undefined;
+
+    // Cancellation is terminal. Late SDK/process completion must not resurrect it.
+    if (task.status === "cancelled") {
+      return task;
+    }
 
     task.status = result.status;
     task.output = result.output;
@@ -140,6 +156,16 @@ export class TaskManager {
       child.kill();
       this.runningProcesses.delete(taskId);
     }
+
+    const cancel = this.runningCancels.get(taskId);
+    if (cancel) {
+      try {
+        cancel();
+      } finally {
+        this.runningCancels.delete(taskId);
+      }
+    }
+
     const task = this.tasks.get(taskId);
     if (task && (task.status === "running" || task.status === "queued")) {
       task.status = "cancelled";
