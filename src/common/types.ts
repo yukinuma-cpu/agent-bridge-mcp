@@ -2,6 +2,40 @@ export type AgentType = "claude" | "codex" | "antigravity";
 
 export type AdapterEngine = "cli" | "sdk";
 
+export interface AgentCapabilities {
+  sessions: boolean;
+  streaming: boolean;
+  cancellation: boolean;
+  models: boolean;
+  sandboxControl: boolean;
+  fileTools: boolean;
+  shellTools: boolean;
+}
+
+export type WorkflowRole = "planner" | "implementer" | "reviewer" | "verifier" | "custom";
+
+export interface WorkflowAgentStep {
+  type: "agent";
+  role: WorkflowRole;
+  agent?: AgentType;
+  engine?: AdapterEngine;
+  requires?: (keyof AgentCapabilities)[];
+  prompt?: string;
+  taskType?: TaskType;
+}
+
+export interface WorkflowEvidenceStep {
+  type: "evidence";
+  role: "verifier";
+  testCommands?: string[];
+}
+
+export type WorkflowStep = WorkflowAgentStep | WorkflowEvidenceStep;
+
+export interface WorkflowDefinition {
+  steps: WorkflowStep[];
+}
+
 export type TaskType =
   | "architecture"
   | "implementation"
@@ -21,9 +55,9 @@ export type TaskStatus =
   | "cancelled";
 
 export interface SessionMetadata {
-  id: string; // Internal bridge session ID
+  id: string;
   agent: AgentType;
-  externalSessionId?: string; // Claude session ID, Codex thread ID, or Agy conversation ID
+  externalSessionId?: string;
   engine?: AdapterEngine;
   project?: string;
   topic?: string;
@@ -59,12 +93,12 @@ export interface AgentExecutionOptions {
   agent: AgentType;
   prompt: string;
   cwd?: string;
-  sessionId?: string; // Explicit internal session ID if known
+  sessionId?: string;
   project?: string;
   topic?: string;
   taskType?: TaskType;
   model?: string;
-  engine?: AdapterEngine; // "cli" (default) or "sdk"
+  engine?: AdapterEngine;
   forceNewSession?: boolean;
   timeoutMs?: number;
 }
@@ -91,7 +125,6 @@ export interface AgentStatusResult {
   exitCode?: number | null;
 }
 
-// Phase 6: Evidence Gate Types
 export interface GitEvidence {
   isGitRepo: boolean;
   branch?: string;
@@ -121,7 +154,6 @@ export interface EvidenceReport {
   summary: string;
 }
 
-// Phase 5: Automated Review Loop Types
 export type ReviewVerdict = "PASS" | "REVISE" | "ESCALATE";
 
 export interface ReviewLoopIteration {
