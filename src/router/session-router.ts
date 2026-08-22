@@ -1,34 +1,26 @@
 import { SessionStore } from "../sessions/session-store.js";
 import { TaskManager } from "../tasks/task-manager.js";
-import { ClaudeAdapter } from "../adapters/claude/claude-adapter.js";
-import { CodexAdapter } from "../adapters/codex/codex-adapter.js";
-import { CodexSdkAdapter } from "../adapters/codex/sdk-adapter.js";
-import { AntigravityAdapter } from "../adapters/antigravity/antigravity-adapter.js";
+import { AgentRegistry } from "../adapters/agent-registry.js";
 import {
   AgentExecutionOptions,
   AgentSendResult,
   SessionMetadata,
   AdapterEngine,
+  AgentCapabilities,
 } from "../common/types.js";
 import * as path from "node:path";
 
 export class SessionRouter {
   private sessionStore: SessionStore;
   private taskManager: TaskManager;
-  private claudeCliAdapter: ClaudeAdapter;
-  private codexCliAdapter: CodexAdapter;
-  private codexSdkAdapter: CodexSdkAdapter;
-  private antigravityAdapter: AntigravityAdapter;
+  private registry: AgentRegistry;
   private workspaceDir: string;
 
-  constructor(baseDir?: string, workspaceDir?: string) {
+  constructor(baseDir?: string, workspaceDir?: string, registry?: AgentRegistry) {
     this.workspaceDir = path.resolve(workspaceDir || process.env.AGENT_BRIDGE_WORKSPACE || process.cwd());
     this.sessionStore = new SessionStore(baseDir);
     this.taskManager = new TaskManager(baseDir);
-    this.claudeCliAdapter = new ClaudeAdapter();
-    this.codexCliAdapter = new CodexAdapter();
-    this.codexSdkAdapter = new CodexSdkAdapter();
-    this.antigravityAdapter = new AntigravityAdapter();
+    this.registry = registry || new AgentRegistry();
   }
 
   async init(): Promise<void> {
@@ -47,12 +39,31 @@ export class SessionRouter {
     if (candidate !== base && !candidate.startsWith(base + path.sep)) {
       throw new Error(`Working directory is outside AGENT_BRIDGE_WORKSPACE: ${candidate}`);
     }
-
     return candidate;
   }
 
   getWorkspaceDir(): string {
     return this.workspaceDir;
+  }
+
+  getRegistry(): AgentRegistry {
+    return this.registry;
+  }
+
+  listAgentCapabilities() {
+    return this.registry.list().map((adapter) => ({
+      agent: adapter.id,
+      engine: adapter.engine,
+      capabilities: adapter.capabilities,
+    }));
+  }
+
+  findAgentsByCapabilities(requires: (keyof AgentCapabilities)[], engine?: AdapterEngine) {
+    return this.registry.findByCapabilities(requires, engine).map((adapter) => ({
+      agent: adapter.id,
+      engine: adapter.engine,
+      capabilities: adapter.capabilities,
+    }));
   }
 
   private assertSessionCompatible(
@@ -79,37 +90,28 @@ export class SessionRouter {
     await this.init();
     const cwd = this.resolveWorkingDirectory({ cwd: options.cwd, project: options.project });
     const engine: AdapterEngine = options.engine || "cli";
-
-    if (options.agent === "claude" && engine === "sdk") {
-      throw new Error(
-        "Claude engine='sdk' is disabled because the previous adapter used the Messages API, not Claude Code capabilities. Use engine='cli' until the Claude Agent SDK migration is implemented."
-      );
-    }
+    const adapter = this.registry.get(options.agent, engine);
 
     let session: SessionMetadata | undefined;
-
     if (options.sessionId) {
       session = await this.sessionStore.getSession(options.sessionId);
-      if (!session) {
-        throw new Error(`Session not found: ${options.sessionId}`);
-      }
+      if (!session) throw new Error(`Session not found: ${options.sessionId}`);
       this.assertSessionCompatible(session, options, cwd, engine);
-    } else if (!options.forceNewSession) {
+    } else if (!options.forceNewSession && adapter.capabilities.sessions) {
       session = await this.sessionStore.findMatchingSession({
         agent: options.agent,
         cwd,
         project: options.project,
         topic: options.topic,
         taskType: options.taskType,
+        engine,
       });
-      if (session && session.engine && session.engine !== engine) {
-        session = undefined;
-      }
     }
 
     if (!session) {
       session = await this.sessionStore.createSession({
         agent: options.agent,
+        engine,
         cwd,
         project: options.project,
         topic: options.topic,
@@ -120,6 +122,7 @@ export class SessionRouter {
 
     const task = await this.taskManager.createTask({
       agent: options.agent,
+      engine,
       sessionId: session.id,
       externalSessionId: session.externalSessionId,
       taskType: options.taskType,
@@ -129,166 +132,48 @@ export class SessionRouter {
       cwd,
     });
 
-    if (options.agent === "antigravity") {
-      const { process: child, promise } = this.antigravityAdapter.execute(options.prompt, {
-        cwd,
-        externalSessionId: session.externalSessionId,
-        model: options.model,
-        timeoutMs: options.timeoutMs,
-        onOutput: (chunk) => this.taskManager.appendOutput(task.id, chunk),
-      });
+    const run = adapter.execute({
+      prompt: options.prompt,
+      cwd,
+      externalSessionId: adapter.capabilities.sessions ? session.externalSessionId : undefined,
+      model: options.model,
+      timeoutMs: options.timeoutMs,
+      onOutput: (chunk) => this.taskManager.appendOutput(task.id, chunk),
+    });
 
-      this.taskManager.registerProcess(task.id, child);
-
-      promise
-        .then(async (res) => {
-          const status = res.exitCode === 0 ? "completed" : "failed";
-          await this.taskManager.completeTask(task.id, {
-            status,
-            output: res.output || res.error || "",
-            error: res.error,
-            exitCode: res.exitCode,
-            externalSessionId: res.detectedSessionId,
-          });
-
-          if (session) {
-            await this.sessionStore.updateSession(session.id, {
-              externalSessionId: res.detectedSessionId || session.externalSessionId,
-              engine: "cli",
-              summary: options.prompt.slice(0, 100),
-            });
-          }
-        })
-        .catch(async (err) => {
-          await this.taskManager.completeTask(task.id, {
-            status: "failed",
-            output: "",
-            error: err.message,
-            exitCode: -1,
-          });
-        });
-    } else if (options.agent === "claude") {
-      const { process: child, promise } = this.claudeCliAdapter.execute(
-        options.prompt,
-        {
-          cwd,
-          externalSessionId: session.externalSessionId,
-          model: options.model,
-          timeoutMs: options.timeoutMs,
-          onOutput: (chunk) => this.taskManager.appendOutput(task.id, chunk),
-        }
-      );
-
-      this.taskManager.registerProcess(task.id, child);
-
-      promise
-        .then(async (res) => {
-          const status = res.exitCode === 0 ? "completed" : "failed";
-          await this.taskManager.completeTask(task.id, {
-            status,
-            output: res.output || res.error || "",
-            error: res.error,
-            exitCode: res.exitCode,
-            externalSessionId: res.detectedSessionId,
-          });
-
-          if (res.detectedSessionId && session) {
-            await this.sessionStore.updateSession(session.id, {
-              externalSessionId: res.detectedSessionId,
-              engine: "cli",
-              summary: options.prompt.slice(0, 100),
-            });
-          }
-        })
-        .catch(async (err) => {
-          await this.taskManager.completeTask(task.id, {
-            status: "failed",
-            output: "",
-            error: err.message,
-            exitCode: -1,
-          });
-        });
-    } else if (options.agent === "codex") {
-      if (engine === "sdk") {
-        const controller = new AbortController();
-        this.taskManager.registerCancellation(task.id, () => controller.abort());
-
-        this.codexSdkAdapter
-          .execute(options.prompt, {
-            cwd,
-            externalSessionId: session.externalSessionId,
-            timeoutMs: options.timeoutMs,
-            signal: controller.signal,
-            onOutput: (chunk) => this.taskManager.appendOutput(task.id, chunk),
-          })
-          .then(async (res) => {
-            const status = res.exitCode === 0 ? "completed" : "failed";
-            await this.taskManager.completeTask(task.id, {
-              status,
-              output: res.output || res.error || "",
-              error: res.error,
-              exitCode: res.exitCode,
-              externalSessionId: res.detectedThreadId,
-            });
-
-            if (res.detectedThreadId && session) {
-              await this.sessionStore.updateSession(session.id, {
-                externalSessionId: res.detectedThreadId,
-                engine: "sdk",
-                summary: options.prompt.slice(0, 100),
-              });
-            }
-          })
-          .catch(async (err) => {
-            await this.taskManager.completeTask(task.id, {
-              status: "failed",
-              output: "",
-              error: err.message,
-              exitCode: -1,
-            });
-          });
-      } else {
-        const { process: child, promise } = this.codexCliAdapter.execute(
-          options.prompt,
-          {
-            cwd,
-            externalSessionId: session.externalSessionId,
-            timeoutMs: options.timeoutMs,
-            onOutput: (chunk) => this.taskManager.appendOutput(task.id, chunk),
-          }
-        );
-
-        this.taskManager.registerProcess(task.id, child);
-
-        promise
-          .then(async (res) => {
-            const status = res.exitCode === 0 ? "completed" : "failed";
-            await this.taskManager.completeTask(task.id, {
-              status,
-              output: res.output || res.error || "",
-              error: res.error,
-              exitCode: res.exitCode,
-              externalSessionId: res.detectedThreadId,
-            });
-
-            if (res.detectedThreadId && session) {
-              await this.sessionStore.updateSession(session.id, {
-                externalSessionId: res.detectedThreadId,
-                engine: "cli",
-                summary: options.prompt.slice(0, 100),
-              });
-            }
-          })
-          .catch(async (err) => {
-            await this.taskManager.completeTask(task.id, {
-              status: "failed",
-              output: "",
-              error: err.message,
-              exitCode: -1,
-            });
-          });
-      }
+    if (run.process) {
+      this.taskManager.registerProcess(task.id, run.process);
+    } else if (run.cancel) {
+      this.taskManager.registerCancellation(task.id, run.cancel);
+    } else {
+      this.taskManager.registerCancellation(task.id, () => {});
     }
+
+    run.promise
+      .then(async (res) => {
+        const status = res.exitCode === 0 ? "completed" : "failed";
+        await this.taskManager.completeTask(task.id, {
+          status,
+          output: res.output || res.error || "",
+          error: res.error,
+          exitCode: res.exitCode,
+          externalSessionId: res.externalSessionId,
+        });
+
+        await this.sessionStore.updateSession(session!.id, {
+          externalSessionId: res.externalSessionId || session!.externalSessionId,
+          engine,
+          summary: options.prompt.slice(0, 100),
+        });
+      })
+      .catch(async (err) => {
+        await this.taskManager.completeTask(task.id, {
+          status: "failed",
+          output: "",
+          error: err instanceof Error ? err.message : String(err),
+          exitCode: -1,
+        });
+      });
 
     return {
       taskId: task.id,
