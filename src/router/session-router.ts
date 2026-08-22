@@ -12,7 +12,6 @@ import {
   SessionMetadata,
   AdapterEngine,
 } from "../common/types.js";
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 export class SessionRouter {
@@ -27,7 +26,7 @@ export class SessionRouter {
   private workspaceDir: string;
 
   constructor(baseDir?: string, workspaceDir?: string) {
-    this.workspaceDir = workspaceDir || process.env.AGENT_BRIDGE_WORKSPACE || process.cwd();
+    this.workspaceDir = path.resolve(workspaceDir || process.env.AGENT_BRIDGE_WORKSPACE || process.cwd());
     this.sessionStore = new SessionStore(baseDir);
     this.taskManager = new TaskManager(baseDir);
     this.claudeCliAdapter = new ClaudeAdapter();
@@ -43,12 +42,35 @@ export class SessionRouter {
     await this.taskManager.init();
   }
 
+  /**
+   * Resolve every execution target through one workspace boundary.
+   * `project` is interpreted relative to the workspace; explicit `cwd` is allowed
+   * only when it resolves inside the same workspace.
+   */
+  resolveWorkingDirectory(options: { cwd?: string; project?: string }): string {
+    const base = this.workspaceDir;
+    const candidate = options.cwd
+      ? path.resolve(options.cwd)
+      : options.project
+        ? path.resolve(base, options.project)
+        : base;
+
+    if (candidate !== base && !candidate.startsWith(base + path.sep)) {
+      throw new Error(`Working directory is outside AGENT_BRIDGE_WORKSPACE: ${candidate}`);
+    }
+
+    return candidate;
+  }
+
+  getWorkspaceDir(): string {
+    return this.workspaceDir;
+  }
+
   async dispatch(options: AgentExecutionOptions): Promise<AgentSendResult> {
     await this.init();
-    const cwd = options.cwd || process.cwd();
+    const cwd = this.resolveWorkingDirectory({ cwd: options.cwd, project: options.project });
     const engine: AdapterEngine = options.engine || "cli";
 
-    // 1. Resolve Session
     let session: SessionMetadata | undefined;
 
     if (options.sessionId) {
@@ -74,7 +96,6 @@ export class SessionRouter {
       });
     }
 
-    // 2. Create Task Record
     const task = await this.taskManager.createTask({
       agent: options.agent,
       sessionId: session.id,
@@ -86,7 +107,6 @@ export class SessionRouter {
       cwd,
     });
 
-    // 3. Dispatch to appropriate Engine & Adapter
     if (options.agent === "antigravity") {
       const { process: child, promise } = this.antigravityAdapter.execute(options.prompt, {
         cwd,
@@ -124,7 +144,6 @@ export class SessionRouter {
         });
     } else if (options.agent === "claude") {
       if (engine === "sdk") {
-        // SDK Execution
         this.claudeSdkAdapter
           .execute(options.prompt, {
             cwd,
@@ -152,7 +171,6 @@ export class SessionRouter {
             }
           });
       } else {
-        // CLI Execution
         const { process: child, promise } = this.claudeCliAdapter.execute(
           options.prompt,
           {
@@ -196,7 +214,6 @@ export class SessionRouter {
       }
     } else if (options.agent === "codex") {
       if (engine === "sdk") {
-        // SDK Execution
         this.codexSdkAdapter
           .execute(options.prompt, {
             cwd,
@@ -223,7 +240,6 @@ export class SessionRouter {
             }
           });
       } else {
-        // CLI Execution
         const { process: child, promise } = this.codexCliAdapter.execute(
           options.prompt,
           {
