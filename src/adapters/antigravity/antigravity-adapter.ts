@@ -6,18 +6,16 @@ export interface AntigravityExecutionResult {
   output: string;
   error?: string;
   exitCode: number | null;
+  detectedSessionId?: string;
 }
 
-/**
- * Antigravity (`agy`) CLI adapter.
- *
- * `agy` starts an internal language server and expects to be attached to a terminal.
- * Launched from a plain pipe it shuts down before answering; launched with no stdin
- * at all it exits immediately. Both look like a hang from the caller's side.
- *
- * So on Windows we run it under `winpty`, which hands it a pseudo terminal, and we
- * deliberately leave our end of stdin open for the lifetime of the call.
- */
+interface AgyJsonEnvelope {
+  conversation_id?: string;
+  status?: string;
+  response?: string;
+  error?: string;
+}
+
 export class AntigravityAdapter {
   private resolveWinpty(): string | null {
     const candidates = [
@@ -45,10 +43,6 @@ export class AntigravityAdapter {
     return "agy";
   }
 
-  /**
-   * winpty は色制御と、自身が cols/rows=0 で落ちるときの assertion をノイズとして混ぜてくる。
-   * assertion は複数行に割れて届くので、先頭行だけでなく継続行も落とす。
-   */
   private cleanOutput(raw: string): string {
     return raw
       .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "")
@@ -61,16 +55,33 @@ export class AntigravityAdapter {
 
   private static readonly WINPTY_NOISE = /Assertion failed|libwinpty|winpty\.cc|cols > 0 && rows > 0/;
 
-  /** timeout で打ち切った agy はゾンビ化しうるので、プロセスツリーごと落とす。 */
+  private parseJsonEnvelope(raw: string): AgyJsonEnvelope | undefined {
+    const lines = this.cleanOutput(raw)
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .reverse();
+
+    for (const line of lines) {
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed && typeof parsed === "object" && ("status" in parsed || "conversation_id" in parsed)) {
+          return parsed as AgyJsonEnvelope;
+        }
+      } catch {
+        // winpty may add non-JSON terminal noise around the final envelope.
+      }
+    }
+    return undefined;
+  }
+
   private reap(child: ChildProcess): void {
     if (process.platform !== "win32" || child.pid === undefined) {
       child.kill("SIGKILL");
       return;
     }
-    // プロセスツリー指定で落とす。`/IM agy.exe` だと利用者が別に開いている
-    // 対話中の agy まで巻き込むので使わない。
     execFile("taskkill", ["/PID", String(child.pid), "/T", "/F"], () => {
-      /* 既に終了している場合のエラーは無視してよい */
+      /* ignore already-exited process errors */
     });
   }
 
@@ -78,12 +89,9 @@ export class AntigravityAdapter {
     prompt: string,
     options: {
       cwd: string;
+      externalSessionId?: string;
       timeoutMs?: number;
       model?: string;
-      /**
-       * 既定では agy の権限確認を飛ばす。無人実行が前提のため、確認を残すと
-       * プロンプト待ちのまま止まる。対話的に承認したい場合だけ false を渡す。
-       */
       bypassPermissions?: boolean;
       onOutput?: (chunk: string) => void;
     }
@@ -92,7 +100,14 @@ export class AntigravityAdapter {
     promise: Promise<AntigravityExecutionResult>;
   } {
     const agy = this.resolveAgy();
-    const agyArgs = ["-p", prompt];
+    const agyArgs = ["-p", prompt, "--output-format", "json"];
+
+    if (options.externalSessionId) {
+      if (!/^[0-9a-f-]{36}$/i.test(options.externalSessionId)) {
+        throw new Error("Invalid Antigravity conversation ID");
+      }
+      agyArgs.push("--conversation", options.externalSessionId);
+    }
     if (options.bypassPermissions !== false) {
       agyArgs.push("--dangerously-skip-permissions");
     }
@@ -102,10 +117,7 @@ export class AntigravityAdapter {
     let args: string[];
 
     const winpty = process.platform === "win32" ? this.resolveWinpty() : null;
-    const viaWinpty = Boolean(winpty);
     if (winpty) {
-      // -Xplain      色制御を抑止する
-      // -Xallow-non-tty  呼び出し側が端末でなくても pty を作らせる
       executable = winpty;
       args = ["-Xplain", "-Xallow-non-tty", agy, ...agyArgs];
     } else {
@@ -119,9 +131,6 @@ export class AntigravityAdapter {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env },
     });
-
-    // stdin は閉じない。閉じると agy が応答前に落ちる。
-    // （シェルでの `< <(sleep N)` に相当する部分をここで担保している）
 
     const promise = new Promise<AntigravityExecutionResult>((resolve) => {
       let stdoutData = "";
@@ -140,45 +149,61 @@ export class AntigravityAdapter {
       }
 
       child.stdout?.on("data", (chunk: Buffer) => {
-        const text = this.cleanOutput(chunk.toString());
-        stdoutData += text;
-        if (text && options.onOutput) options.onOutput(text);
+        stdoutData += chunk.toString();
       });
 
       child.stderr?.on("data", (chunk: Buffer) => {
         stderrData += this.cleanOutput(chunk.toString());
       });
 
-      const finish = (exitCode: number | null, errorMessage?: string) => {
+      const finish = (result: AntigravityExecutionResult) => {
         if (isResolved) return;
         isResolved = true;
         if (timer) clearTimeout(timer);
         child.stdin?.end();
-        resolve({
-          output: stdoutData.trim(),
-          error: errorMessage || stderrData.trim() || undefined,
-          exitCode,
-        });
+        resolve(result);
       };
 
       child.on("close", (code) => {
         if (timedOut) {
-          finish(-1, `Execution timed out after ${options.timeoutMs}ms. Stderr: ${stderrData.trim()}`);
+          finish({
+            output: "",
+            error: `Execution timed out after ${options.timeoutMs}ms. Stderr: ${stderrData.trim()}`,
+            exitCode: -1,
+          });
           return;
         }
-        if (!stdoutData.trim()) {
-          finish(code === 0 ? 1 : code, `agy produced no output. Stderr: ${stderrData.trim() || "(empty)"}`);
+
+        const envelope = this.parseJsonEnvelope(stdoutData);
+        if (!envelope) {
+          const fallback = this.cleanOutput(stdoutData).trim();
+          finish({
+            output: fallback,
+            error: fallback ? stderrData.trim() || undefined : `agy produced no parseable JSON output. Stderr: ${stderrData.trim() || "(empty)"}`,
+            exitCode: fallback && code === 0 ? 0 : code === 0 ? 1 : code,
+          });
           return;
         }
-        // winpty は自身の assertion で abort するため、agy の終了コードをそのまま返さない
-        // （応答が正常でも 3 などになる）。pty 経由のときは終了コードを信用せず、
-        // 応答が得られたかどうかで成否を判定する。
-        finish(viaWinpty ? 0 : code);
+
+        const response = envelope.response?.trim() || "";
+        if (response && options.onOutput) options.onOutput(response);
+        const succeeded = envelope.status === "SUCCESS";
+
+        finish({
+          output: response,
+          error: succeeded ? undefined : envelope.error || stderrData.trim() || `agy status: ${envelope.status || "unknown"}`,
+          exitCode: succeeded ? 0 : code === 0 ? 1 : code,
+          detectedSessionId: envelope.conversation_id || undefined,
+        });
       });
 
       child.on("error", (err) => {
         this.reap(child);
-        finish(-1, `Failed to launch ${executable}: ${err.message}`);
+        finish({
+          output: "",
+          error: `Failed to launch ${executable}: ${err.message}`,
+          exitCode: -1,
+        });
       });
     });
 

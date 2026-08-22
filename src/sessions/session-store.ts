@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { SessionMetadata, AgentType, TaskType } from "../common/types.js";
+import * as crypto from "node:crypto";
+import { SessionMetadata, AgentType, TaskType, AdapterEngine } from "../common/types.js";
 
 export class SessionStore {
   private filePath: string;
@@ -18,11 +19,8 @@ export class SessionStore {
       await fs.mkdir(path.dirname(this.filePath), { recursive: true });
       const data = await fs.readFile(this.filePath, "utf-8");
       const list: SessionMetadata[] = JSON.parse(data);
-      for (const s of list) {
-        this.sessions.set(s.id, s);
-      }
+      for (const s of list) this.sessions.set(s.id, s);
     } catch {
-      // File doesn't exist yet or invalid JSON, initialize empty
       this.sessions = new Map();
       await this.save();
     }
@@ -31,10 +29,9 @@ export class SessionStore {
 
   private async save(): Promise<void> {
     const list = Array.from(this.sessions.values());
-    const tempPath = `${this.filePath}.${Date.now()}.tmp`;
-    const json = JSON.stringify(list, null, 2);
+    const tempPath = `${this.filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
     await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-    await fs.writeFile(tempPath, json, "utf-8");
+    await fs.writeFile(tempPath, JSON.stringify(list, null, 2), "utf-8");
     await fs.rename(tempPath, this.filePath);
   }
 
@@ -59,10 +56,7 @@ export class SessionStore {
       if (filter.taskType) list = list.filter((s) => s.taskType === filter.taskType);
       if (filter.status) list = list.filter((s) => s.status === filter.status);
     }
-    return list.sort(
-      (a, b) =>
-        new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
-    );
+    return list.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
   }
 
   async findMatchingSession(options: {
@@ -71,15 +65,13 @@ export class SessionStore {
     project?: string;
     topic?: string;
     taskType?: TaskType;
+    engine?: AdapterEngine;
   }): Promise<SessionMetadata | undefined> {
     await this.init();
-    const active = await this.listSessions({
-      agent: options.agent,
-      status: "active",
-    });
+    const active = await this.listSessions({ agent: options.agent, status: "active" });
+    const compatible = active.filter((s) => !options.engine || !s.engine || s.engine === options.engine);
 
-    // Best match: agent + project + topic + taskType in same cwd
-    const exact = active.find(
+    const exact = compatible.find(
       (s) =>
         s.cwd === options.cwd &&
         s.project === options.project &&
@@ -88,15 +80,10 @@ export class SessionStore {
     );
     if (exact) return exact;
 
-    // Second best match: agent + project + topic in same cwd
     if (options.project && options.topic) {
-      const topicMatch = active.find(
-        (s) =>
-          s.cwd === options.cwd &&
-          s.project === options.project &&
-          s.topic === options.topic
+      return compatible.find(
+        (s) => s.cwd === options.cwd && s.project === options.project && s.topic === options.topic
       );
-      if (topicMatch) return topicMatch;
     }
 
     return undefined;
@@ -109,6 +96,7 @@ export class SessionStore {
     topic?: string;
     taskType?: TaskType;
     externalSessionId?: string;
+    engine?: AdapterEngine;
     summary?: string;
   }): Promise<SessionMetadata> {
     await this.init();
@@ -118,6 +106,7 @@ export class SessionStore {
       id,
       agent: data.agent,
       externalSessionId: data.externalSessionId,
+      engine: data.engine,
       project: data.project,
       topic: data.topic,
       taskType: data.taskType,

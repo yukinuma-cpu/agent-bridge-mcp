@@ -18,11 +18,27 @@ export class CodexSdkAdapter {
     prompt: string,
     options: {
       cwd: string;
-      externalSessionId?: string; // Thread ID
+      externalSessionId?: string;
       timeoutMs?: number;
+      signal?: AbortSignal;
       onOutput?: (chunk: string) => void;
     }
   ): Promise<CodexSdkExecutionResult> {
+    const controller = new AbortController();
+    let timedOut = false;
+    let timer: NodeJS.Timeout | undefined;
+
+    const abortFromCaller = () => controller.abort();
+    options.signal?.addEventListener("abort", abortFromCaller, { once: true });
+    if (options.signal?.aborted) controller.abort();
+
+    if (options.timeoutMs && options.timeoutMs > 0) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, options.timeoutMs);
+    }
+
     try {
       const threadOptions = {
         workingDirectory: options.cwd,
@@ -38,7 +54,7 @@ export class CodexSdkAdapter {
       let resultText = "";
 
       if (options.onOutput) {
-        const streamedTurn = await thread.runStreamed(prompt);
+        const streamedTurn = await thread.runStreamed(prompt, { signal: controller.signal });
         for await (const event of streamedTurn.events) {
           if (event.type === "item.updated" || event.type === "item.completed") {
             if (event.item.type === "agent_message") {
@@ -49,23 +65,29 @@ export class CodexSdkAdapter {
           }
         }
       } else {
-        const turn = await thread.run(prompt);
+        const turn = await thread.run(prompt, { signal: controller.signal });
         resultText = turn.finalResponse;
       }
-
-      const threadId = thread.id || undefined;
 
       return {
         output: resultText.trim(),
         exitCode: 0,
-        detectedThreadId: threadId,
+        detectedThreadId: thread.id || undefined,
       };
     } catch (err: any) {
+      const aborted = controller.signal.aborted;
       return {
         output: "",
-        error: `Codex SDK error: ${err.message}`,
-        exitCode: 1,
+        error: timedOut
+          ? `Codex SDK execution timed out after ${options.timeoutMs}ms`
+          : aborted
+            ? "Codex SDK execution cancelled"
+            : `Codex SDK error: ${err.message}`,
+        exitCode: aborted ? -1 : 1,
       };
+    } finally {
+      if (timer) clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abortFromCaller);
     }
   }
 }

@@ -1,12 +1,14 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import * as crypto from "node:crypto";
 import { ChildProcess } from "node:child_process";
-import { TaskRecord, TaskStatus, AgentType, TaskType } from "../common/types.js";
+import { TaskRecord, TaskStatus, AgentType, TaskType, AdapterEngine } from "../common/types.js";
 
 export class TaskManager {
   private filePath: string;
   private tasks: Map<string, TaskRecord> = new Map();
   private runningProcesses: Map<string, ChildProcess> = new Map();
+  private runningCancels: Map<string, () => void> = new Map();
   private loaded = false;
   private onOutputChunk?: (taskId: string, chunk: string) => void;
 
@@ -42,15 +44,15 @@ export class TaskManager {
 
   private async save(): Promise<void> {
     const list = Array.from(this.tasks.values());
-    const tempPath = `${this.filePath}.${Date.now()}.tmp`;
-    const json = JSON.stringify(list, null, 2);
+    const tempPath = `${this.filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
     await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-    await fs.writeFile(tempPath, json, "utf-8");
+    await fs.writeFile(tempPath, JSON.stringify(list, null, 2), "utf-8");
     await fs.rename(tempPath, this.filePath);
   }
 
   async createTask(data: {
     agent: AgentType;
+    engine?: AdapterEngine;
     sessionId: string;
     externalSessionId?: string;
     taskType?: TaskType;
@@ -65,6 +67,7 @@ export class TaskManager {
     const record: TaskRecord = {
       id,
       agent: data.agent,
+      engine: data.engine,
       sessionId: data.sessionId,
       externalSessionId: data.externalSessionId,
       taskType: data.taskType || "general",
@@ -81,8 +84,7 @@ export class TaskManager {
     return record;
   }
 
-  registerProcess(taskId: string, child: ChildProcess): void {
-    this.runningProcesses.set(taskId, child);
+  private markRunning(taskId: string): void {
     const task = this.tasks.get(taskId);
     if (task) {
       task.status = "running";
@@ -91,13 +93,21 @@ export class TaskManager {
     }
   }
 
+  registerProcess(taskId: string, child: ChildProcess): void {
+    this.runningProcesses.set(taskId, child);
+    this.markRunning(taskId);
+  }
+
+  registerCancellation(taskId: string, cancel: () => void): void {
+    this.runningCancels.set(taskId, cancel);
+    this.markRunning(taskId);
+  }
+
   appendOutput(taskId: string, chunk: string): void {
     const task = this.tasks.get(taskId);
-    if (task) {
+    if (task && task.status !== "cancelled") {
       task.output += chunk;
-      if (this.onOutputChunk) {
-        this.onOutputChunk(taskId, chunk);
-      }
+      this.onOutputChunk?.(taskId, chunk);
     }
   }
 
@@ -113,16 +123,16 @@ export class TaskManager {
   ): Promise<TaskRecord | undefined> {
     await this.init();
     this.runningProcesses.delete(taskId);
+    this.runningCancels.delete(taskId);
     const task = this.tasks.get(taskId);
     if (!task) return undefined;
+    if (task.status === "cancelled") return task;
 
     task.status = result.status;
     task.output = result.output;
     task.error = result.error;
     task.exitCode = result.exitCode;
-    if (result.externalSessionId) {
-      task.externalSessionId = result.externalSessionId;
-    }
+    if (result.externalSessionId) task.externalSessionId = result.externalSessionId;
     task.completedAt = new Date().toISOString();
     await this.save();
     return task;
@@ -140,6 +150,16 @@ export class TaskManager {
       child.kill();
       this.runningProcesses.delete(taskId);
     }
+
+    const cancel = this.runningCancels.get(taskId);
+    if (cancel) {
+      try {
+        cancel();
+      } finally {
+        this.runningCancels.delete(taskId);
+      }
+    }
+
     const task = this.tasks.get(taskId);
     if (task && (task.status === "running" || task.status === "queued")) {
       task.status = "cancelled";
@@ -162,9 +182,6 @@ export class TaskManager {
       if (filter.sessionId) list = list.filter((t) => t.sessionId === filter.sessionId);
       if (filter.status) list = list.filter((t) => t.status === filter.status);
     }
-    return list.sort(
-      (a, b) =>
-        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-    );
+    return list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   }
 }

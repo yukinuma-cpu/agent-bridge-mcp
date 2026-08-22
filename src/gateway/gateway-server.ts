@@ -3,12 +3,12 @@ import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import { WebSocketServer, WebSocket } from "ws";
 import * as http from "node:http";
-import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import { SessionRouter } from "../router/session-router.js";
 import { EvidenceGate } from "../evidence/evidence-gate.js";
 import { GitManager } from "../evidence/git.js";
 import { ReviewLoopOrchestrator } from "../orchestrator/review-loop.js";
+import { WorkflowEngine } from "../orchestrator/workflow-engine.js";
 
 export interface GatewayOptions {
   port?: number;
@@ -36,14 +36,13 @@ export class GatewayServer {
   private evidenceGate: EvidenceGate;
   private gitManager: GitManager;
   private reviewLoopOrchestrator: ReviewLoopOrchestrator;
+  private workflowEngine: WorkflowEngine;
   private wsServer?: WebSocketServer;
   private activeClients: Set<WebSocket> = new Set();
   private httpServer?: http.Server;
 
   constructor(options?: GatewayOptions) {
     this.port = options?.port || parseInt(process.env.PORT || "3030", 10);
-    // 既定トークンは持たせない。任意のエージェント実行と git push を通すエンドポイントなので、
-    // 既知の既定値のまま起動されるほうが「認証なし」より危険。
     this.authToken = options?.authToken || process.env.ABC_AUTH_TOKEN || "";
     this.rootDir = options?.rootDir || process.env.AGENT_BRIDGE_ROOT || process.cwd();
     this.workspaceDir = options?.workspaceDir || process.env.AGENT_BRIDGE_WORKSPACE || process.cwd();
@@ -56,29 +55,20 @@ export class GatewayServer {
     this.evidenceGate = new EvidenceGate();
     this.gitManager = new GitManager();
     this.reviewLoopOrchestrator = new ReviewLoopOrchestrator(this.sessionRouter);
+    this.workflowEngine = new WorkflowEngine(this.sessionRouter);
 
     this.app = new Hono();
     this.setupRoutes();
   }
 
-  /**
-   * `project` 名を workspaceDir 配下のパスへ解決する。
-   * project は HTTP body 由来なので、workspaceDir の外へ出る値は拒否する。
-   */
-  private resolveProjectDir(project: string): string | null {
-    const base = path.resolve(this.workspaceDir);
-    const resolved = path.resolve(base, project);
-    if (resolved !== base && !resolved.startsWith(base + path.sep)) {
+  /** Resolve HTTP-provided cwd/project using the same workspace rule as MCP dispatch. */
+  private cwdFromBody(body: { cwd?: string; project?: string }): string | null {
+    if (!body.cwd && !body.project) return null;
+    try {
+      return this.sessionRouter.resolveWorkingDirectory({ cwd: body.cwd, project: body.project });
+    } catch {
       return null;
     }
-    return resolved;
-  }
-
-  /** リクエスト body から作業ディレクトリを決める。決められない場合は null。 */
-  private cwdFromBody(body: { cwd?: string; project?: string }): string | null {
-    if (body.cwd) return body.cwd;
-    if (body.project) return this.resolveProjectDir(body.project);
-    return null;
   }
 
   private async discoverProjects(): Promise<string[]> {
@@ -94,13 +84,10 @@ export class GatewayServer {
   }
 
   private setupRoutes() {
-    // 1. CORS
     const allowed = this.allowedOrigins;
     this.app.use(
       "*",
       cors({
-        // 既定は localhost / 127.0.0.1 のみ。他のオリジンを通したい場合は
-        // AGENT_BRIDGE_ALLOWED_ORIGINS で明示する。
         origin: (origin) => {
           if (!origin) return origin;
           if (allowed) return allowed.includes(origin) ? origin : null;
@@ -111,21 +98,17 @@ export class GatewayServer {
       })
     );
 
-    // 2. Auth Middleware
     this.app.use("/api/*", async (c, next) => {
       const authHeader = c.req.header("Authorization");
       const queryToken = c.req.query("token");
       const token = authHeader?.replace("Bearer ", "") || queryToken;
 
-      // トークン未設定時は fail-closed。設定漏れが「全開放」にならないようにする。
       if (!this.authToken || token !== this.authToken) {
         return c.json({ error: "Unauthorized: Invalid or missing token" }, 401);
       }
       await next();
     });
 
-    // 3. REST Endpoints
-    // Status
     this.app.get("/api/status", async (c) => {
       await this.sessionRouter.init();
       const tasks = await this.sessionRouter.getTaskManager().listTasks();
@@ -146,13 +129,15 @@ export class GatewayServer {
       });
     });
 
-    // Projects List
     this.app.get("/api/projects", async (c) => {
       const projects = await this.discoverProjects();
       return c.json({ projects });
     });
 
-    // Sessions List
+    this.app.get("/api/capabilities", (c) => {
+      return c.json({ agents: this.sessionRouter.listAgentCapabilities() });
+    });
+
     this.app.get("/api/sessions", async (c) => {
       const agent = c.req.query("agent") as any;
       const project = c.req.query("project");
@@ -161,7 +146,6 @@ export class GatewayServer {
       return c.json({ sessions });
     });
 
-    // Tasks List
     this.app.get("/api/tasks", async (c) => {
       const agent = c.req.query("agent") as any;
       const sessionId = c.req.query("sessionId");
@@ -174,7 +158,6 @@ export class GatewayServer {
       return c.json({ tasks });
     });
 
-    // Task Detail
     this.app.get("/api/tasks/:id", async (c) => {
       const id = c.req.param("id");
       const task = await this.sessionRouter.getTaskManager().getTask(id);
@@ -182,50 +165,44 @@ export class GatewayServer {
       return c.json({ task });
     });
 
-    // Dispatch Task
     this.app.post("/api/dispatch", async (c) => {
       const body = await c.req.json();
       const cwd = this.cwdFromBody(body);
       if (!cwd) {
         return c.json({ error: "Either 'cwd' or a 'project' inside the workspace is required" }, 400);
       }
-      const result = await this.sessionRouter.dispatch({
-        agent: body.agent,
-        prompt: body.prompt,
-        cwd,
-        sessionId: body.sessionId,
-        project: body.project,
-        topic: body.topic,
-        model: body.model,
-        engine: body.engine || "cli",
-        taskType: body.taskType,
-        forceNewSession: body.forceNewSession,
-        timeoutMs: body.timeoutMs,
-      });
+      try {
+        const result = await this.sessionRouter.dispatch({
+          agent: body.agent,
+          prompt: body.prompt,
+          cwd,
+          sessionId: body.sessionId,
+          project: body.project,
+          topic: body.topic,
+          model: body.model,
+          engine: body.engine || "cli",
+          taskType: body.taskType,
+          forceNewSession: body.forceNewSession,
+          timeoutMs: body.timeoutMs,
+        });
 
-      this.broadcast({
-        type: "task:dispatched",
-        payload: result,
-      });
-
-      return c.json(result);
+        this.broadcast({ type: "task:dispatched", payload: result });
+        return c.json(result);
+      } catch (err: any) {
+        return c.json({ error: err.message }, 400);
+      }
     });
 
-    // Cancel Task
     this.app.post("/api/tasks/:id/cancel", async (c) => {
       const id = c.req.param("id");
       const success = await this.sessionRouter.getTaskManager().cancelTask(id);
-      this.broadcast({
-        type: "task:cancelled",
-        payload: { taskId: id, success },
-      });
+      this.broadcast({ type: "task:cancelled", payload: { taskId: id, success } });
       return c.json({ taskId: id, cancelled: success });
     });
 
-    // Evidence Gate Check
     this.app.post("/api/evidence", async (c) => {
       const body = await c.req.json().catch(() => ({}));
-      const cwd = this.cwdFromBody(body) || this.rootDir;
+      const cwd = this.cwdFromBody(body) || this.sessionRouter.getWorkspaceDir();
       const report = await this.evidenceGate.evaluate({
         cwd,
         testCommands: body.testCommands || [],
@@ -234,11 +211,8 @@ export class GatewayServer {
       return c.json(report);
     });
 
-    // Git Commit & Push (One-Tap Approval)
     this.app.post("/api/git/commit-push", async (c) => {
       const body = await c.req.json();
-      // 書き込み先は必ず明示させる。既定値を持たせると、指定漏れのリクエストが
-      // 無関係のリポジトリを commit & push してしまう。
       const cwd = this.cwdFromBody(body);
       if (!cwd) {
         return c.json({ error: "Either 'cwd' or a 'project' inside the workspace is required" }, 400);
@@ -247,14 +221,46 @@ export class GatewayServer {
       const result = await this.gitManager.commitAndPush(cwd, message);
 
       this.broadcast({
-        type: "git:committed",
-        payload: { project: body.project, success: result.success, message },
+        type: result.pushed ? "git:pushed" : "git:push_failed",
+        payload: {
+          project: body.project,
+          success: result.success,
+          committed: result.committed,
+          pushed: result.pushed,
+          message,
+          error: result.error,
+        },
       });
 
-      return c.json(result);
+      return c.json(result, result.success ? 200 : 500);
     });
 
-    // Review Loop Dispatch
+    this.app.post("/api/workflow", async (c) => {
+      const body = await c.req.json();
+      const cwd = this.cwdFromBody(body);
+      if (!cwd) {
+        return c.json({ error: "Either 'cwd' or a 'project' inside the workspace is required" }, 400);
+      }
+      if (!body.workflow || !Array.isArray(body.workflow.steps) || body.workflow.steps.length === 0) {
+        return c.json({ error: "workflow.steps must be a non-empty array" }, 400);
+      }
+      try {
+        const result = await this.workflowEngine.run({
+          workflow: body.workflow,
+          input: body.input || "",
+          cwd,
+          project: body.project,
+          topic: body.topic,
+          timeoutMs: body.timeoutMs,
+        });
+        this.broadcast({ type: "workflow:completed", payload: result });
+        return c.json(result, result.status === "COMPLETED" ? 200 : 422);
+      } catch (err: any) {
+        this.broadcast({ type: "workflow:failed", payload: { error: err.message } });
+        return c.json({ error: err.message }, 400);
+      }
+    });
+
     this.app.post("/api/review-loop", async (c) => {
       const body = await c.req.json();
       const cwd = this.cwdFromBody(body);
@@ -276,16 +282,10 @@ export class GatewayServer {
           timeoutMs: body.timeoutMs,
         })
         .then((result) => {
-          this.broadcast({
-            type: "review_loop:completed",
-            payload: result,
-          });
+          this.broadcast({ type: "review_loop:completed", payload: result });
         })
         .catch((err) => {
-          this.broadcast({
-            type: "review_loop:failed",
-            payload: { error: err.message },
-          });
+          this.broadcast({ type: "review_loop:failed", payload: { error: err.message } });
         });
 
       return c.json({
@@ -316,12 +316,8 @@ export class GatewayServer {
 
     await this.sessionRouter.init();
 
-    // Hook task output streaming to WebSocket broadcasting
     this.sessionRouter.getTaskManager().setOutputListener((taskId, chunk) => {
-      this.broadcast({
-        type: "task:chunk",
-        payload: { taskId, chunk },
-      });
+      this.broadcast({ type: "task:chunk", payload: { taskId, chunk } });
     });
 
     return new Promise((resolve) => {
@@ -333,7 +329,6 @@ export class GatewayServer {
         },
         (info) => {
           console.log(`🚀 Agent Bridge Gateway running at http://${this.host}:${info.port}`);
-          // トークンは平文で出さない。設定できているかだけ分かれば足りる。
           console.log(`🔑 Auth token: configured (${this.authToken.length} chars)`);
           if (this.host !== "127.0.0.1" && this.host !== "localhost") {
             console.warn(

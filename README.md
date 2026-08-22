@@ -1,24 +1,98 @@
 # agent-bridge-mcp
 
-An MCP server and HTTP gateway that dispatches coding tasks to **Claude Code**,
-**Codex**, and **Antigravity (`agy`)** CLI sessions, keeps track of those sessions,
-and optionally runs an implement → review → verify loop against a real repository.
+A capability-aware MCP server and HTTP/WebSocket gateway for orchestrating interchangeable coding agents.
 
-> **Status: experimental.** This started as a personal orchestration rig and is
-> published in the hope that the session-routing and evidence-gate parts are
-> useful to others. Interfaces will change.
+Agent Bridge treats each agent as an adapter behind a common runtime contract. The core router does not hard-code Claude, Codex, or Antigravity behavior; registered adapters advertise capabilities such as sessions, streaming, cancellation, model selection, sandbox control, file tools, and shell tools. Workflows may name a specific agent or select one by required capabilities.
 
-## What it does
+> **Status: experimental.** Interfaces may still change. The runtime is intended for trusted local development environments and should not be exposed to untrusted networks.
 
-- **Session routing** — starts and resumes Claude Code / Codex sessions per project
-  and topic, so follow-up prompts land in the same context.
-- **Task tracking** — every dispatch becomes a task with status, output, and exit code.
-- **Evidence gate** — runs the test commands you specify in a repository and reports
-  whether the change is actually backed by passing tests before you accept it.
-- **Review loop** — dispatches an implementer agent and a reviewer agent in turn,
-  up to a revision limit, gated on the evidence check.
-- **Gateway** — the same capabilities over HTTP + WebSocket, so a remote client
-  (for example a phone) can dispatch work and stream output.
+## Architecture
+
+```text
+MCP / HTTP / WebSocket
+        |
+        v
+  SessionRouter
+        |
+        v
+   AgentRegistry
+        |
+   AgentAdapter
+   /    |       \
+Claude Codex  Antigravity  ...
+        |
+        +--> TaskManager
+        +--> SessionStore
+
+WorkflowEngine ----> EvidenceGate ----> Git / tests / typecheck / lint
+     |
+     +--> ReviewLoop preset
+```
+
+The built-in adapters currently cover:
+
+- **Claude Code CLI**
+- **Codex CLI**
+- **Codex SDK**
+- **Antigravity (`agy`) CLI**
+
+Additional agents can be added by implementing and registering another `AgentAdapter`; the core `AgentType` is not a closed union of built-in names.
+
+## Core concepts
+
+### Agent Registry and capabilities
+
+Each registered adapter declares:
+
+- `sessions`
+- `streaming`
+- `cancellation`
+- `models`
+- `sandboxControl`
+- `fileTools`
+- `shellTools`
+
+Call `agent_capabilities` over MCP or `GET /api/capabilities` over HTTP to inspect what is available.
+
+A workflow can select a concrete adapter:
+
+```yaml
+- type: agent
+  role: implementer
+  agent: codex
+  engine: cli
+```
+
+or request capabilities and let the registry choose:
+
+```yaml
+- type: agent
+  role: implementer
+  requires:
+    - sessions
+    - fileTools
+    - shellTools
+```
+
+### Generic workflows
+
+`WorkflowEngine` executes ordered role-based steps. An agent step can receive:
+
+- `{{input}}`
+- `{{previousOutput}}`
+- `{{evidenceSummary}}`
+- `{{gitDiff}}`
+- `{{testResults}}`
+
+Evidence steps are fail-closed: no verification commands means no verified PASS.
+
+The older implement → evidence → review loop remains available as a compatibility preset on top of the generic workflow runtime. Implementer and reviewer are selectable registered agents rather than fixed core dependencies.
+
+### Sessions and tasks
+
+Agent Bridge tracks internal sessions and external agent session/thread/conversation IDs. Matching considers agent, engine, workspace, project, topic, and task type. Explicit session reuse is rejected when the requested agent/engine/workspace is incompatible.
+
+Every dispatch creates a task record with status, output, error, and exit code. Cancellation is terminal; late completion cannot resurrect a cancelled task.
 
 ## Install
 
@@ -26,28 +100,13 @@ and optionally runs an implement → review → verify loop against a real repos
 npm install -g @yukinuma/agent-bridge-mcp
 ```
 
-Requires Node.js 20+, plus whichever agent CLIs you intend to drive
-(`claude`, `codex`, and/or `agy`) already installed and authenticated.
+Requires Node.js 20+ and whichever agent CLIs you intend to drive already installed and authenticated.
 
-### A note on the `antigravity` agent
+### Antigravity on Windows
 
-`agy` runs an internal language server and expects a real terminal. Started from an
-ordinary pipe it shuts down before it answers, which from the caller's side is
-indistinguishable from a hang. On Windows this adapter therefore runs it under
-`winpty` (bundled with Git for Windows) and keeps stdin open for the duration of
-the call.
+`agy` expects a real terminal. On Windows the adapter runs it under `winpty` when available and keeps stdin open for the call. It persists the returned conversation ID and resumes with `--conversation` on later turns.
 
-Two consequences worth knowing:
-
-- `winpty` aborts on its own assertion while tearing down, so its exit code does not
-  reflect what `agy` did. When running through a pty the adapter judges success by
-  whether a response came back, not by the exit code, and filters the assertion text
-  out of the captured output.
-- On timeout the process tree is killed by PID. Killing by image name would take out
-  any interactive `agy` you have open elsewhere, so that is deliberately not done.
-
-Set `WINPTY_PATH` or `AGY_PATH` if either binary is somewhere non-standard. On
-non-Windows platforms `agy` is launched directly, which is untested.
+Set `WINPTY_PATH` or `AGY_PATH` if either binary is in a non-standard location. Non-Windows Antigravity execution is not yet well tested.
 
 ## Use as an MCP server
 
@@ -64,9 +123,20 @@ non-Windows platforms `agy` is launched directly, which is untested.
 }
 ```
 
-Tools exposed: `agent_send`, `agent_status`, `agent_sessions`, `agent_cancel`.
+MCP tools:
 
-## Use as a gateway
+| Tool | Purpose |
+| --- | --- |
+| `agent_send` | Dispatch to any registered agent/engine |
+| `agent_capabilities` | List adapters or find capability matches |
+| `agent_status` | Inspect a task |
+| `agent_sessions` | List tracked sessions |
+| `agent_cancel` | Cancel a task |
+| `agent_evidence_check` | Run fail-closed repository verification |
+| `agent_workflow` | Execute a generic role-based workflow |
+| `agent_review_loop` | Run the compatibility implement/review preset |
+
+## Use as an HTTP/WebSocket gateway
 
 ```bash
 export ABC_AUTH_TOKEN="$(openssl rand -hex 24)"
@@ -74,75 +144,109 @@ export AGENT_BRIDGE_WORKSPACE="/path/to/your/projects"
 agent-bridge-gateway
 ```
 
-The gateway **refuses to start without `ABC_AUTH_TOKEN`**. There is no default token.
+The gateway **refuses to start without `ABC_AUTH_TOKEN`**.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `ABC_AUTH_TOKEN` | *(required)* | Shared secret for REST and WebSocket auth |
 | `PORT` | `3030` | Listening port |
 | `AGENT_BRIDGE_HOST` | `127.0.0.1` | Bind address |
-| `AGENT_BRIDGE_WORKSPACE` | `process.cwd()` | Base directory that `project` names resolve against |
-| `AGENT_BRIDGE_ROOT` | `process.cwd()` | Where session and task state files are written |
+| `AGENT_BRIDGE_WORKSPACE` | `process.cwd()` | Root boundary for execution targets |
+| `AGENT_BRIDGE_ROOT` | `process.cwd()` | Session/task state directory |
 | `AGENT_BRIDGE_ALLOWED_ORIGINS` | localhost only | Comma-separated CORS allowlist |
 
-### Endpoints
+### HTTP endpoints
 
-| Method | Path | Notes |
+| Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/status` | Gateway and running-task summary |
-| `GET` | `/api/projects` | Directories found under the workspace |
+| `GET` | `/api/projects` | Workspace projects |
+| `GET` | `/api/capabilities` | Registered adapters and capabilities |
 | `GET` | `/api/sessions` | List sessions |
 | `GET` | `/api/tasks`, `/api/tasks/:id` | List / inspect tasks |
-| `POST` | `/api/dispatch` | Dispatch a task to an agent |
-| `POST` | `/api/tasks/:id/cancel` | Cancel a running task |
-| `POST` | `/api/evidence` | Run the evidence gate |
+| `POST` | `/api/dispatch` | Dispatch a task |
+| `POST` | `/api/tasks/:id/cancel` | Cancel a task |
+| `POST` | `/api/evidence` | Run the Evidence Gate |
+| `POST` | `/api/workflow` | Run a generic workflow |
+| `POST` | `/api/review-loop` | Run the compatibility review loop |
 | `POST` | `/api/git/commit-push` | Commit and push a repository |
-| `POST` | `/api/review-loop` | Run the implement/review loop |
-| `WS` | `/ws?token=…` | Task output and lifecycle events |
+| `WS` | `/ws?token=...` | Stream task/workflow lifecycle events |
 
-`/api/dispatch`, `/api/git/commit-push`, and `/api/review-loop` require an explicit
-target — either `cwd`, or a `project` that resolves inside the workspace. They return
-`400` rather than falling back to a default directory, and `project` values that
-escape the workspace are rejected.
+Execution endpoints require an explicit `cwd` or `project`, and every resolved path must stay inside `AGENT_BRIDGE_WORKSPACE`.
+
+Example generic workflow request:
+
+```json
+{
+  "project": "my-app",
+  "input": "Implement the requested feature and verify it.",
+  "workflow": {
+    "steps": [
+      {
+        "type": "agent",
+        "role": "implementer",
+        "requires": ["fileTools", "shellTools", "sessions"],
+        "prompt": "{{input}}"
+      },
+      {
+        "type": "evidence",
+        "role": "verifier",
+        "testCommands": ["npm test", "npm run typecheck"]
+      },
+      {
+        "type": "agent",
+        "role": "reviewer",
+        "agent": "claude",
+        "prompt": "Review the implementation. Evidence: {{evidenceSummary}}\nDiff:\n{{gitDiff}}"
+      }
+    ]
+  }
+}
+```
+
+## Evidence and review safety
+
+Evidence verification is fail-closed. A reviewer cannot turn a failed or missing Evidence Gate into PASS merely by writing the word `PASS`. Review verdict parsing only accepts a verdict at the beginning of the first non-empty line.
+
+Git commit and push results are tracked separately; a successful local commit with a failed push is reported as failure rather than success.
 
 ## Security
 
-**This service runs coding agents with their safety prompts turned off.** That is what
-makes unattended dispatch work — an agent that stops to ask for approval simply hangs
-when nobody is at the keyboard — but it means anyone who can reach the API can run
-arbitrary code as the user running the gateway.
+This is a **privileged local development daemon**. Built-in unattended CLI adapters may disable approval/sandbox prompts so they do not hang waiting for input.
 
-Specifically, the CLI adapters pass:
+In particular:
 
-| Agent | Flag | Opt out |
-| --- | --- | --- |
-| Codex | `--dangerously-bypass-approvals-and-sandbox` | `bypassApprovals: false` |
-| Antigravity | `--dangerously-skip-permissions` | `bypassPermissions: false` |
+| Agent | Default unattended behavior |
+| --- | --- |
+| Codex CLI | `--dangerously-bypass-approvals-and-sandbox` |
+| Antigravity | `--dangerously-skip-permissions` |
 
-Both default to bypassing. The opt-outs are adapter-level options; they are not yet
-plumbed through the MCP tools or the REST API, so over HTTP the bypass is currently
-unconditional.
+Treat possession of the gateway token as equivalent to powerful local development access.
 
-Treat this as a privileged local daemon:
+- Keep the default bind address at `127.0.0.1` unless you fully trust the network.
+- Prefer the Authorization header over query-string tokens because query strings may be logged.
+- All execution paths are constrained to `AGENT_BRIDGE_WORKSPACE`, but agents still execute with the privileges of the OS user running Agent Bridge.
+- `/api/git/commit-push` pushes to the configured repository remote without a second interactive approval.
 
-- It binds to `127.0.0.1` by default. Setting `AGENT_BRIDGE_HOST` to anything else
-  exposes task dispatch, sandbox-free code execution, and git push to your network.
-- The auth token is a single shared secret, sent as a bearer header or a `token`
-  query parameter. Query parameters end up in logs — prefer the header where you can.
-  Compromising that one token is equivalent to handing over a shell.
-- There is no sandboxing between projects beyond the workspace path check.
-- `/api/git/commit-push` pushes to whatever remote the target repository has
-  configured. It does not ask again before pushing.
+Do not expose the gateway to an untrusted network or run it under an unnecessarily privileged user.
 
-Do not expose this to an untrusted network, and do not run it as a user with more
-access than the work actually needs.
+## Claude SDK status
 
-## Development
+The old `ClaudeSdkAdapter` used the plain Anthropic Messages API and therefore did not provide Claude Code/agent capabilities. That path has been removed. `engine=sdk` for Claude remains intentionally unavailable until a real Claude Agent SDK adapter is implemented.
+
+## Development and verification
 
 ```bash
 npm install
 npm run typecheck
 npm run build
+npm run test:hardening
+```
+
+CI runs typecheck, build, and hardening integration tests. A separate live E2E script validates real authenticated Claude/Codex/Antigravity session continuity when those CLIs are installed locally:
+
+```bash
+npm run test:agents:e2e
 ```
 
 ## License

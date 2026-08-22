@@ -7,7 +7,6 @@ const execFileAsync = promisify(execFile);
 export class GitManager {
   async inspect(cwd: string): Promise<GitEvidence> {
     try {
-      // 1. Check if git repo and get branch + head commit
       const { stdout: headInfo } = await execFileAsync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
         cwd,
         timeout: 10000,
@@ -20,7 +19,6 @@ export class GitManager {
       }).catch(() => ({ stdout: "uncommitted" }));
       const commitHash = commitInfo.trim();
 
-      // 2. Get git status --porcelain
       const { stdout: statusOut } = await execFileAsync("git", ["status", "--porcelain"], {
         cwd,
         timeout: 10000,
@@ -40,7 +38,6 @@ export class GitManager {
         }
       }
 
-      // 3. Get diff summary and stat
       const { stdout: diffStat } = await execFileAsync("git", ["diff", "--stat", "HEAD"], {
         cwd,
         timeout: 10000,
@@ -71,19 +68,49 @@ export class GitManager {
     }
   }
 
-  async commitAndPush(cwd: string, message: string): Promise<{ success: boolean; output: string; error?: string }> {
+  async commitAndPush(
+    cwd: string,
+    message: string
+  ): Promise<{
+    success: boolean;
+    committed: boolean;
+    pushed: boolean;
+    output: string;
+    error?: string;
+  }> {
     try {
       await execFileAsync("git", ["add", "."], { cwd, timeout: 15000 });
-      const { stdout: commitOut } = await execFileAsync("git", ["commit", "-m", message || "feat: AI verified implementation by Agent Bridge"], { cwd, timeout: 20000 });
-      const { stdout: pushOut } = await execFileAsync("git", ["push"], { cwd, timeout: 30000 }).catch((err) => ({ stdout: `Push notice: ${err.message}` }));
+      const { stdout: commitOut, stderr: commitErr } = await execFileAsync(
+        "git",
+        ["commit", "-m", message || "feat: AI verified implementation by Agent Bridge"],
+        { cwd, timeout: 20000 }
+      );
 
-      return {
-        success: true,
-        output: `${commitOut}\n${pushOut}`.trim(),
-      };
+      try {
+        const { stdout: pushOut, stderr: pushErr } = await execFileAsync("git", ["push"], {
+          cwd,
+          timeout: 30000,
+        });
+        return {
+          success: true,
+          committed: true,
+          pushed: true,
+          output: [commitOut, commitErr, pushOut, pushErr].filter(Boolean).join("\n").trim(),
+        };
+      } catch (err: any) {
+        return {
+          success: false,
+          committed: true,
+          pushed: false,
+          output: [commitOut, commitErr].filter(Boolean).join("\n").trim(),
+          error: `Commit succeeded but push failed: ${err.message}`,
+        };
+      }
     } catch (err: any) {
       return {
         success: false,
+        committed: false,
+        pushed: false,
         output: "",
         error: err.message,
       };

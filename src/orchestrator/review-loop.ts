@@ -1,23 +1,26 @@
 import { SessionRouter } from "../router/session-router.js";
-import { EvidenceGate } from "../evidence/evidence-gate.js";
+import { WorkflowEngine } from "./workflow-engine.js";
 import {
   ReviewLoopResult,
   ReviewLoopIteration,
   ReviewVerdict,
   AdapterEngine,
+  AgentType,
+  EvidenceReport,
 } from "../common/types.js";
 
-async function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+export function parseReviewVerdict(output: string): ReviewVerdict {
+  const firstLine = output.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "";
+  if (/^PASS\b/.test(firstLine)) return "PASS";
+  if (/^ESCALATE\b/.test(firstLine)) return "ESCALATE";
+  return "REVISE";
 }
 
 export class ReviewLoopOrchestrator {
-  private router: SessionRouter;
-  private evidenceGate: EvidenceGate;
+  private readonly workflow: WorkflowEngine;
 
   constructor(router: SessionRouter) {
-    this.router = router;
-    this.evidenceGate = new EvidenceGate();
+    this.workflow = new WorkflowEngine(router);
   }
 
   async run(options: {
@@ -35,109 +38,88 @@ export class ReviewLoopOrchestrator {
     const maxRevisions = options.maxRevisions ?? 2;
     const project = options.project || "default-project";
     const topic = options.topic || `task-${Date.now()}`;
-    const implementer = options.implementer || "codex";
-    const reviewer = options.reviewer || "claude";
+    const implementer = (options.implementer || "codex") as AgentType;
+    const reviewer = (options.reviewer || "claude") as AgentType;
     const engine = options.engine || "cli";
     const timeoutMs = options.timeoutMs || 180000;
 
     const iterations: ReviewLoopIteration[] = [];
     let currentPrompt = options.prompt;
     let iteration = 0;
-    let finalVerdict: ReviewVerdict = "REVISE";
 
     while (iteration <= maxRevisions) {
-      // 1. Dispatch Implementation Task to Implementer Agent
-      const implSend = await this.router.dispatch({
-        agent: implementer as any,
-        prompt: currentPrompt,
+      const implementationRun = await this.workflow.run({
+        workflow: {
+          steps: [{
+            type: "agent",
+            role: "implementer",
+            agent: implementer,
+            engine,
+            taskType: iteration === 0 ? "implementation" : "refactor",
+            prompt: "{{input}}",
+          }],
+        },
+        input: currentPrompt,
         cwd: options.cwd,
         project,
-        topic,
-        taskType: iteration === 0 ? "implementation" : "refactor",
-        engine,
+        topic: `${topic}:iteration:${iteration}:implementation`,
         timeoutMs,
       });
+      const implTask = implementationRun.steps[0]?.task;
 
-      // Wait for Codex implementation to complete
-      let implTask = await this.router.getTaskManager().getTask(implSend.taskId);
-      while (implTask && (implTask.status === "running" || implTask.status === "queued")) {
-        await sleep(1000);
-        implTask = await this.router.getTaskManager().getTask(implSend.taskId);
-      }
-
-      // 2. Evaluate Evidence Gate (Git diff + Automated Tests)
-      const evidence = await this.evidenceGate.evaluate({
+      const evidenceRun = await this.workflow.run({
+        workflow: {
+          steps: [{ type: "evidence", role: "verifier", testCommands: options.testCommands || [] }],
+        },
+        input: options.prompt,
         cwd: options.cwd,
-        testCommands: options.testCommands,
+        project,
+        topic: `${topic}:iteration:${iteration}:evidence`,
         timeoutMs: 60000,
       });
+      const evidence = evidenceRun.steps[0]?.evidence as EvidenceReport;
 
-      // 3. Dispatch Review Task to Claude (Reviewer Independence: separate task_type/session)
-      const reviewPrompt = `
-You are a senior code reviewer.
-Original Task:
-${options.prompt}
+      const reviewInput = `Original Task:\n${options.prompt}\n\nImplementation Task Status:\n${implTask?.status || "missing"}\n\nImplementation Output:\n${implTask?.output || "(No text output)"}\n\nEvidence Gate Summary:\n${evidence?.summary || "(No evidence)"}\n\nGit Diff:\n${evidence?.git.diffSummary || "(No git diff)"}\n\nTest Results:\n${evidence?.tests.map((t) => `- [${t.passed ? "PASS" : "FAIL"}] ${t.command}: ${t.output || t.error || ""}`).join("\n") || "(No automated tests executed)"}\n\nInstructions:\n1. Review the changes thoroughly.\n2. The first non-empty line MUST start with PASS, REVISE, or ESCALATE.\n3. PASS is allowed only when implementation and evidence are both successful.\n4. REVISE must contain actionable feedback.\n5. ESCALATE only for impossible, contradictory, or human-decision tasks.`;
 
-Implementation Output:
-${implTask?.output || "(No text output)"}
-
-Evidence Gate Summary:
-${evidence.summary}
-
-Git Diff:
-\`\`\`diff
-${evidence.git.diffSummary || "(No git diff)"}
-\`\`\`
-
-Test Results:
-${evidence.tests.map((t) => `- [${t.passed ? "PASS" : "FAIL"}] \`${t.command}\`: ${t.output || t.error || ""}`).join("\n") || "(No automated tests executed)"}
-
-Instructions:
-1. Review the changes thoroughly.
-2. If the implementation is correct and all tests pass, start your response with "PASS" followed by a summary.
-3. If there are issues, bugs, or failing tests, start your response with "REVISE" followed by specific, actionable instructions for ${implementer}.
-4. If the task is impossible, contradictory, or requires human business decision, start with "ESCALATE".
-`.trim();
-
-      const reviewSend = await this.router.dispatch({
-        agent: reviewer as any,
-        prompt: reviewPrompt,
+      const reviewRun = await this.workflow.run({
+        workflow: {
+          steps: [{
+            type: "agent",
+            role: "reviewer",
+            agent: reviewer,
+            engine,
+            taskType: "review",
+            prompt: "{{input}}",
+          }],
+        },
+        input: reviewInput,
         cwd: options.cwd,
         project,
-        topic: `${topic}-review`,
-        taskType: "review",
-        engine,
+        topic: `${topic}:iteration:${iteration}:review`,
         timeoutMs,
       });
-
-      // Wait for reviewer review to complete
-      let reviewTask = await this.router.getTaskManager().getTask(reviewSend.taskId);
-      while (reviewTask && (reviewTask.status === "running" || reviewTask.status === "queued")) {
-        await sleep(1000);
-        reviewTask = await this.router.getTaskManager().getTask(reviewSend.taskId);
-      }
-
+      const reviewTask = reviewRun.steps[0]?.task;
       const reviewOutput = reviewTask?.output || "";
-      let verdict: ReviewVerdict = "REVISE";
+      let verdict = parseReviewVerdict(reviewOutput);
 
-      if (reviewOutput.startsWith("PASS") || reviewOutput.includes("PASS")) {
-        verdict = "PASS";
-      } else if (reviewOutput.startsWith("ESCALATE") || reviewOutput.includes("ESCALATE")) {
-        verdict = "ESCALATE";
-      } else {
+      if (
+        verdict === "PASS" &&
+        (implTask?.status !== "completed" || reviewTask?.status !== "completed" || !evidence?.allPassed)
+      ) {
+        verdict = "REVISE";
+      }
+      if (reviewTask?.status !== "completed" && verdict !== "ESCALATE") {
         verdict = "REVISE";
       }
 
       iterations.push({
         iteration,
-        implementationTaskId: implSend.taskId,
+        implementationTaskId: implTask?.id || "missing",
         evidence,
-        reviewTaskId: reviewSend.taskId,
+        reviewTaskId: reviewTask?.id || "missing",
         verdict,
         feedback: reviewOutput,
       });
-
-      finalVerdict = verdict;
 
       if (verdict === "PASS") {
         return {
@@ -146,7 +128,7 @@ Instructions:
           maxRevisionsReached: false,
           iterations,
           finalVerdict: "PASS",
-          summary: `Task completed successfully and approved by Claude in iteration ${iteration}.`,
+          summary: `Task completed successfully with passing evidence and reviewer approval in iteration ${iteration}.`,
         };
       }
 
@@ -157,19 +139,13 @@ Instructions:
           maxRevisionsReached: false,
           iterations,
           finalVerdict: "ESCALATE",
-          summary: `Task escalated by Claude in iteration ${iteration}: ${reviewOutput.slice(0, 200)}`,
+          summary: `Task escalated by reviewer in iteration ${iteration}: ${reviewOutput.slice(0, 200)}`,
         };
       }
 
-      // If REVISE, prepare next prompt for Codex
       iteration++;
       if (iteration <= maxRevisions) {
-        currentPrompt = `
-Reviewer Claude requested revisions:
-${reviewOutput}
-
-Please fix the issues identified by the reviewer and ensure all tests pass.
-`.trim();
+        currentPrompt = `Reviewer requested revisions:\n${reviewOutput || "Reviewer did not return a valid verdict."}\n\nEvidence status:\n${evidence?.summary || "No evidence available"}\n\nPlease fix the issues and ensure the configured verification commands pass.`;
       }
     }
 
@@ -179,7 +155,7 @@ Please fix the issues identified by the reviewer and ensure all tests pass.
       maxRevisionsReached: true,
       iterations,
       finalVerdict: "REVISE",
-      summary: `Max revisions limit (${maxRevisions}) reached without full PASS. Escalating to Antigravity/User.`,
+      summary: `Max revisions limit (${maxRevisions}) reached without a verified PASS.`,
     };
   }
 }
