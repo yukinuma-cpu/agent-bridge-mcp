@@ -24,6 +24,9 @@
     "start": "node dist/server/mcp-server.js",
     "gateway": "node dist/start-gateway.js",
     "test:full": "node dist/test-full-spec.js",
+    "test:hardening": "node dist/test-hardening.js",
+    "test:agents:e2e": "node dist/test-agents-e2e.js",
+    "test:ci": "npm run typecheck && npm run build && npm run test:hardening",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
