@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import * as crypto from "node:crypto";
 import { SessionMetadata, AgentType, TaskType, AdapterEngine } from "../common/types.js";
 
 export class SessionStore {
@@ -28,7 +29,7 @@ export class SessionStore {
 
   private async save(): Promise<void> {
     const list = Array.from(this.sessions.values());
-    const tempPath = `${this.filePath}.${Date.now()}.tmp`;
+    const tempPath = `${this.filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
     await fs.mkdir(path.dirname(this.filePath), { recursive: true });
     await fs.writeFile(tempPath, JSON.stringify(list, null, 2), "utf-8");
     await fs.rename(tempPath, this.filePath);
