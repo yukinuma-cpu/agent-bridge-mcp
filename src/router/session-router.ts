@@ -3,7 +3,6 @@ import { TaskManager } from "../tasks/task-manager.js";
 import { ClaudeAdapter } from "../adapters/claude/claude-adapter.js";
 import { CodexAdapter } from "../adapters/codex/codex-adapter.js";
 import { CodexSdkAdapter } from "../adapters/codex/sdk-adapter.js";
-import { ClaudeSdkAdapter } from "../adapters/claude/sdk-adapter.js";
 import { AntigravityAdapter } from "../adapters/antigravity/antigravity-adapter.js";
 import {
   AgentExecutionOptions,
@@ -19,7 +18,6 @@ export class SessionRouter {
   private claudeCliAdapter: ClaudeAdapter;
   private codexCliAdapter: CodexAdapter;
   private codexSdkAdapter: CodexSdkAdapter;
-  private claudeSdkAdapter: ClaudeSdkAdapter;
   private antigravityAdapter: AntigravityAdapter;
   private workspaceDir: string;
 
@@ -30,7 +28,6 @@ export class SessionRouter {
     this.claudeCliAdapter = new ClaudeAdapter();
     this.codexCliAdapter = new CodexAdapter();
     this.codexSdkAdapter = new CodexSdkAdapter();
-    this.claudeSdkAdapter = new ClaudeSdkAdapter();
     this.antigravityAdapter = new AntigravityAdapter();
   }
 
@@ -62,6 +59,12 @@ export class SessionRouter {
     await this.init();
     const cwd = this.resolveWorkingDirectory({ cwd: options.cwd, project: options.project });
     const engine: AdapterEngine = options.engine || "cli";
+
+    if (options.agent === "claude" && engine === "sdk") {
+      throw new Error(
+        "Claude engine='sdk' is disabled because the previous adapter used the Messages API, not Claude Code capabilities. Use engine='cli' until the Claude Agent SDK migration is implemented."
+      );
+    }
 
     let session: SessionMetadata | undefined;
 
@@ -135,87 +138,46 @@ export class SessionRouter {
           });
         });
     } else if (options.agent === "claude") {
-      if (engine === "sdk") {
-        const controller = new AbortController();
-        this.taskManager.registerCancellation(task.id, () => controller.abort());
+      const { process: child, promise } = this.claudeCliAdapter.execute(
+        options.prompt,
+        {
+          cwd,
+          externalSessionId: session.externalSessionId,
+          model: options.model,
+          timeoutMs: options.timeoutMs,
+          onOutput: (chunk) => this.taskManager.appendOutput(task.id, chunk),
+        }
+      );
 
-        this.claudeSdkAdapter
-          .execute(options.prompt, {
-            cwd,
-            externalSessionId: session.externalSessionId,
-            model: options.model,
-            timeoutMs: options.timeoutMs,
-            signal: controller.signal,
-            onOutput: (chunk) => this.taskManager.appendOutput(task.id, chunk),
-          })
-          .then(async (res) => {
-            const status = res.exitCode === 0 ? "completed" : "failed";
-            await this.taskManager.completeTask(task.id, {
-              status,
-              output: res.output || res.error || "",
-              error: res.error,
-              exitCode: res.exitCode,
-              externalSessionId: res.detectedSessionId,
-            });
+      this.taskManager.registerProcess(task.id, child);
 
-            if (res.detectedSessionId && session) {
-              await this.sessionStore.updateSession(session.id, {
-                externalSessionId: res.detectedSessionId,
-                engine: "sdk",
-                summary: options.prompt.slice(0, 100),
-              });
-            }
-          })
-          .catch(async (err) => {
-            await this.taskManager.completeTask(task.id, {
-              status: "failed",
-              output: "",
-              error: err.message,
-              exitCode: -1,
-            });
+      promise
+        .then(async (res) => {
+          const status = res.exitCode === 0 ? "completed" : "failed";
+          await this.taskManager.completeTask(task.id, {
+            status,
+            output: res.output || res.error || "",
+            error: res.error,
+            exitCode: res.exitCode,
+            externalSessionId: res.detectedSessionId,
           });
-      } else {
-        const { process: child, promise } = this.claudeCliAdapter.execute(
-          options.prompt,
-          {
-            cwd,
-            externalSessionId: session.externalSessionId,
-            model: options.model,
-            timeoutMs: options.timeoutMs,
-            onOutput: (chunk) => this.taskManager.appendOutput(task.id, chunk),
+
+          if (res.detectedSessionId && session) {
+            await this.sessionStore.updateSession(session.id, {
+              externalSessionId: res.detectedSessionId,
+              engine: "cli",
+              summary: options.prompt.slice(0, 100),
+            });
           }
-        );
-
-        this.taskManager.registerProcess(task.id, child);
-
-        promise
-          .then(async (res) => {
-            const status = res.exitCode === 0 ? "completed" : "failed";
-            await this.taskManager.completeTask(task.id, {
-              status,
-              output: res.output || res.error || "",
-              error: res.error,
-              exitCode: res.exitCode,
-              externalSessionId: res.detectedSessionId,
-            });
-
-            if (res.detectedSessionId && session) {
-              await this.sessionStore.updateSession(session.id, {
-                externalSessionId: res.detectedSessionId,
-                engine: "cli",
-                summary: options.prompt.slice(0, 100),
-              });
-            }
-          })
-          .catch(async (err) => {
-            await this.taskManager.completeTask(task.id, {
-              status: "failed",
-              output: "",
-              error: err.message,
-              exitCode: -1,
-            });
+        })
+        .catch(async (err) => {
+          await this.taskManager.completeTask(task.id, {
+            status: "failed",
+            output: "",
+            error: err.message,
+            exitCode: -1,
           });
-      }
+        });
     } else if (options.agent === "codex") {
       if (engine === "sdk") {
         const controller = new AbortController();
