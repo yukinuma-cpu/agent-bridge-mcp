@@ -8,6 +8,7 @@ import { SessionRouter } from "../router/session-router.js";
 import { EvidenceGate } from "../evidence/evidence-gate.js";
 import { GitManager } from "../evidence/git.js";
 import { ReviewLoopOrchestrator } from "../orchestrator/review-loop.js";
+import { WorkflowEngine } from "../orchestrator/workflow-engine.js";
 
 export interface GatewayOptions {
   port?: number;
@@ -35,6 +36,7 @@ export class GatewayServer {
   private evidenceGate: EvidenceGate;
   private gitManager: GitManager;
   private reviewLoopOrchestrator: ReviewLoopOrchestrator;
+  private workflowEngine: WorkflowEngine;
   private wsServer?: WebSocketServer;
   private activeClients: Set<WebSocket> = new Set();
   private httpServer?: http.Server;
@@ -53,6 +55,7 @@ export class GatewayServer {
     this.evidenceGate = new EvidenceGate();
     this.gitManager = new GitManager();
     this.reviewLoopOrchestrator = new ReviewLoopOrchestrator(this.sessionRouter);
+    this.workflowEngine = new WorkflowEngine(this.sessionRouter);
 
     this.app = new Hono();
     this.setupRoutes();
@@ -131,6 +134,10 @@ export class GatewayServer {
       return c.json({ projects });
     });
 
+    this.app.get("/api/capabilities", (c) => {
+      return c.json({ agents: this.sessionRouter.listAgentCapabilities() });
+    });
+
     this.app.get("/api/sessions", async (c) => {
       const agent = c.req.query("agent") as any;
       const project = c.req.query("project");
@@ -179,11 +186,7 @@ export class GatewayServer {
           timeoutMs: body.timeoutMs,
         });
 
-        this.broadcast({
-          type: "task:dispatched",
-          payload: result,
-        });
-
+        this.broadcast({ type: "task:dispatched", payload: result });
         return c.json(result);
       } catch (err: any) {
         return c.json({ error: err.message }, 400);
@@ -193,10 +196,7 @@ export class GatewayServer {
     this.app.post("/api/tasks/:id/cancel", async (c) => {
       const id = c.req.param("id");
       const success = await this.sessionRouter.getTaskManager().cancelTask(id);
-      this.broadcast({
-        type: "task:cancelled",
-        payload: { taskId: id, success },
-      });
+      this.broadcast({ type: "task:cancelled", payload: { taskId: id, success } });
       return c.json({ taskId: id, cancelled: success });
     });
 
@@ -235,6 +235,32 @@ export class GatewayServer {
       return c.json(result, result.success ? 200 : 500);
     });
 
+    this.app.post("/api/workflow", async (c) => {
+      const body = await c.req.json();
+      const cwd = this.cwdFromBody(body);
+      if (!cwd) {
+        return c.json({ error: "Either 'cwd' or a 'project' inside the workspace is required" }, 400);
+      }
+      if (!body.workflow || !Array.isArray(body.workflow.steps) || body.workflow.steps.length === 0) {
+        return c.json({ error: "workflow.steps must be a non-empty array" }, 400);
+      }
+      try {
+        const result = await this.workflowEngine.run({
+          workflow: body.workflow,
+          input: body.input || "",
+          cwd,
+          project: body.project,
+          topic: body.topic,
+          timeoutMs: body.timeoutMs,
+        });
+        this.broadcast({ type: "workflow:completed", payload: result });
+        return c.json(result, result.status === "COMPLETED" ? 200 : 422);
+      } catch (err: any) {
+        this.broadcast({ type: "workflow:failed", payload: { error: err.message } });
+        return c.json({ error: err.message }, 400);
+      }
+    });
+
     this.app.post("/api/review-loop", async (c) => {
       const body = await c.req.json();
       const cwd = this.cwdFromBody(body);
@@ -256,16 +282,10 @@ export class GatewayServer {
           timeoutMs: body.timeoutMs,
         })
         .then((result) => {
-          this.broadcast({
-            type: "review_loop:completed",
-            payload: result,
-          });
+          this.broadcast({ type: "review_loop:completed", payload: result });
         })
         .catch((err) => {
-          this.broadcast({
-            type: "review_loop:failed",
-            payload: { error: err.message },
-          });
+          this.broadcast({ type: "review_loop:failed", payload: { error: err.message } });
         });
 
       return c.json({
@@ -297,10 +317,7 @@ export class GatewayServer {
     await this.sessionRouter.init();
 
     this.sessionRouter.getTaskManager().setOutputListener((taskId, chunk) => {
-      this.broadcast({
-        type: "task:chunk",
-        payload: { taskId, chunk },
-      });
+      this.broadcast({ type: "task:chunk", payload: { taskId, chunk } });
     });
 
     return new Promise((resolve) => {
