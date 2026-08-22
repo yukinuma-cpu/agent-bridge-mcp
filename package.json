@@ -1,7 +1,7 @@
 {
   "name": "@yukinuma/agent-bridge-mcp",
-  "version": "0.2.0",
-  "description": "MCP server and HTTP gateway that dispatches coding tasks to Claude Code and Codex CLI sessions, with an evidence gate and review loop",
+  "version": "0.3.0",
+  "description": "Capability-aware MCP and HTTP runtime for orchestrating interchangeable coding agents with sessions, workflows, evidence, and review gates",
   "type": "module",
   "main": "dist/server/mcp-server.js",
   "types": "dist/server/mcp-server.d.ts",
@@ -35,7 +35,9 @@
     "claude-code",
     "codex",
     "agent",
-    "orchestration"
+    "orchestration",
+    "workflow",
+    "multi-agent"
   ],
   "repository": {
     "type": "git",
