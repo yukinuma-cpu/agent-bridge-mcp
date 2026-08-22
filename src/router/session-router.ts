@@ -5,7 +5,6 @@ import { CodexAdapter } from "../adapters/codex/codex-adapter.js";
 import { CodexSdkAdapter } from "../adapters/codex/sdk-adapter.js";
 import { ClaudeSdkAdapter } from "../adapters/claude/sdk-adapter.js";
 import { AntigravityAdapter } from "../adapters/antigravity/antigravity-adapter.js";
-import { EvidenceGate } from "../evidence/evidence-gate.js";
 import {
   AgentExecutionOptions,
   AgentSendResult,
@@ -22,7 +21,6 @@ export class SessionRouter {
   private codexSdkAdapter: CodexSdkAdapter;
   private claudeSdkAdapter: ClaudeSdkAdapter;
   private antigravityAdapter: AntigravityAdapter;
-  private evidenceGate: EvidenceGate;
   private workspaceDir: string;
 
   constructor(baseDir?: string, workspaceDir?: string) {
@@ -34,7 +32,6 @@ export class SessionRouter {
     this.codexSdkAdapter = new CodexSdkAdapter();
     this.claudeSdkAdapter = new ClaudeSdkAdapter();
     this.antigravityAdapter = new AntigravityAdapter();
-    this.evidenceGate = new EvidenceGate();
   }
 
   async init(): Promise<void> {
@@ -42,11 +39,6 @@ export class SessionRouter {
     await this.taskManager.init();
   }
 
-  /**
-   * Resolve every execution target through one workspace boundary.
-   * `project` is interpreted relative to the workspace; explicit `cwd` is allowed
-   * only when it resolves inside the same workspace.
-   */
   resolveWorkingDirectory(options: { cwd?: string; project?: string }): string {
     const base = this.workspaceDir;
     const candidate = options.cwd
@@ -144,12 +136,16 @@ export class SessionRouter {
         });
     } else if (options.agent === "claude") {
       if (engine === "sdk") {
+        const controller = new AbortController();
+        this.taskManager.registerCancellation(task.id, () => controller.abort());
+
         this.claudeSdkAdapter
           .execute(options.prompt, {
             cwd,
             externalSessionId: session.externalSessionId,
             model: options.model,
             timeoutMs: options.timeoutMs,
+            signal: controller.signal,
             onOutput: (chunk) => this.taskManager.appendOutput(task.id, chunk),
           })
           .then(async (res) => {
@@ -169,6 +165,14 @@ export class SessionRouter {
                 summary: options.prompt.slice(0, 100),
               });
             }
+          })
+          .catch(async (err) => {
+            await this.taskManager.completeTask(task.id, {
+              status: "failed",
+              output: "",
+              error: err.message,
+              exitCode: -1,
+            });
           });
       } else {
         const { process: child, promise } = this.claudeCliAdapter.execute(
@@ -214,11 +218,15 @@ export class SessionRouter {
       }
     } else if (options.agent === "codex") {
       if (engine === "sdk") {
+        const controller = new AbortController();
+        this.taskManager.registerCancellation(task.id, () => controller.abort());
+
         this.codexSdkAdapter
           .execute(options.prompt, {
             cwd,
             externalSessionId: session.externalSessionId,
             timeoutMs: options.timeoutMs,
+            signal: controller.signal,
             onOutput: (chunk) => this.taskManager.appendOutput(task.id, chunk),
           })
           .then(async (res) => {
@@ -238,6 +246,14 @@ export class SessionRouter {
                 summary: options.prompt.slice(0, 100),
               });
             }
+          })
+          .catch(async (err) => {
+            await this.taskManager.completeTask(task.id, {
+              status: "failed",
+              output: "",
+              error: err.message,
+              exitCode: -1,
+            });
           });
       } else {
         const { process: child, promise } = this.codexCliAdapter.execute(
