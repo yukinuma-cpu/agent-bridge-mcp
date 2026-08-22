@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { ChildProcess } from "node:child_process";
-import { TaskRecord, TaskStatus, AgentType, TaskType } from "../common/types.js";
+import { TaskRecord, TaskStatus, AgentType, TaskType, AdapterEngine } from "../common/types.js";
 
 export class TaskManager {
   private filePath: string;
@@ -44,14 +44,14 @@ export class TaskManager {
   private async save(): Promise<void> {
     const list = Array.from(this.tasks.values());
     const tempPath = `${this.filePath}.${Date.now()}.tmp`;
-    const json = JSON.stringify(list, null, 2);
     await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-    await fs.writeFile(tempPath, json, "utf-8");
+    await fs.writeFile(tempPath, JSON.stringify(list, null, 2), "utf-8");
     await fs.rename(tempPath, this.filePath);
   }
 
   async createTask(data: {
     agent: AgentType;
+    engine?: AdapterEngine;
     sessionId: string;
     externalSessionId?: string;
     taskType?: TaskType;
@@ -66,6 +66,7 @@ export class TaskManager {
     const record: TaskRecord = {
       id,
       agent: data.agent,
+      engine: data.engine,
       sessionId: data.sessionId,
       externalSessionId: data.externalSessionId,
       taskType: data.taskType || "general",
@@ -105,9 +106,7 @@ export class TaskManager {
     const task = this.tasks.get(taskId);
     if (task && task.status !== "cancelled") {
       task.output += chunk;
-      if (this.onOutputChunk) {
-        this.onOutputChunk(taskId, chunk);
-      }
+      this.onOutputChunk?.(taskId, chunk);
     }
   }
 
@@ -126,19 +125,13 @@ export class TaskManager {
     this.runningCancels.delete(taskId);
     const task = this.tasks.get(taskId);
     if (!task) return undefined;
-
-    // Cancellation is terminal. Late SDK/process completion must not resurrect it.
-    if (task.status === "cancelled") {
-      return task;
-    }
+    if (task.status === "cancelled") return task;
 
     task.status = result.status;
     task.output = result.output;
     task.error = result.error;
     task.exitCode = result.exitCode;
-    if (result.externalSessionId) {
-      task.externalSessionId = result.externalSessionId;
-    }
+    if (result.externalSessionId) task.externalSessionId = result.externalSessionId;
     task.completedAt = new Date().toISOString();
     await this.save();
     return task;
@@ -188,9 +181,6 @@ export class TaskManager {
       if (filter.sessionId) list = list.filter((t) => t.sessionId === filter.sessionId);
       if (filter.status) list = list.filter((t) => t.status === filter.status);
     }
-    return list.sort(
-      (a, b) =>
-        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-    );
+    return list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   }
 }
